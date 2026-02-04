@@ -542,8 +542,7 @@ def main():
         threshold=0.0001,  # Minimum improvement threshold
         threshold_mode='rel',  # Relative improvement
         cooldown=2,  # Epochs to wait before resuming reduction
-        min_lr=1e-7,  # Don't reduce below this
-        verbose=False
+        min_lr=1e-7  # Don't reduce below this
     )
     
     logger.info("\n" + "="*80)
@@ -625,7 +624,8 @@ def main():
     logger.info(f"Best train loss: {best_train_loss:.4f}")
     logger.info(f"Final overfitting ratio: {best_val_loss/best_train_loss:.2f}x")
     logger.info(f"Learning rate reductions applied: {lr_reduce_counter}")
-    logger.info(f"Checkpoint saved: {checkpoint_dir / f'{args.model}_best.pt')")
+    checkpoint_file = checkpoint_dir / f"{args.model}_best.pt"
+    logger.info(f"Checkpoint saved: {checkpoint_file}")
 
 
 if __name__ == '__main__':
