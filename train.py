@@ -525,32 +525,22 @@ def main():
     best_val_loss = float('inf')
     best_train_loss = float('inf')
     plateau_counter = 0  # Counts epochs without validation improvement
-    lr_reduce_counter = 0  # Counts how many times we've reduced learning rate
+    annealing_mode = False  # Whether we've triggered annealing due to overfitting
+    epochs_in_annealing = 0  # Epochs since annealing was triggered
+    overfitting_detected_epoch = -1  # When overfitting was first detected
     base_learning_rate = learning_rate
     
     # Overfitting detection thresholds
-    overfitting_threshold = 2.0  # Stop if train/val loss ratio exceeds 2.0
-    min_epochs = 20  # Don't stop before this many epochs
-    max_patience_on_plateau = 15  # Patience specifically for LR reduction
-    
-    # Learning rate scheduler: ReduceLROnPlateau
-    lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode='min',
-        factor=0.5,  # Reduce by 50% when plateauing
-        patience=5,  # Patience for detecting plateau
-        threshold=0.0001,  # Minimum improvement threshold
-        threshold_mode='rel',  # Relative improvement
-        cooldown=2,  # Epochs to wait before resuming reduction
-        min_lr=1e-7  # Don't reduce below this
-    )
+    overfitting_threshold = 1.5  # Trigger annealing when ratio exceeds 1.5x
+    min_epochs = 15  # Don't trigger annealing before this
+    annealing_patience = 50  # If annealing doesn't help in 50 epochs, quit
     
     logger.info("\n" + "="*80)
-    logger.info("STARTING TRAINING (Overfitting-Based Early Stopping)")
+    logger.info("STARTING TRAINING (Annealing-Based Strategy)")
     logger.info("="*80)
-    logger.info(f"  Overfitting threshold: {overfitting_threshold}x train/val ratio")
-    logger.info(f"  Min epochs before stopping: {min_epochs}")
-    logger.info(f"  LR plateau patience: {max_patience_on_plateau}")
+    logger.info(f"  Overfitting threshold: {overfitting_threshold}x (triggers annealing)")
+    logger.info(f"  Annealing patience: {annealing_patience} epochs")
+    logger.info(f"  If no improvement after annealing, stop training")
     logger.info("="*80 + "\n")
     
     for epoch in range(num_epochs):
@@ -569,14 +559,24 @@ def main():
         # Calculate overfitting ratio
         overfitting_ratio = val_loss / train_loss if train_loss > 0 else float('inf')
         
-        logger.info(f"Epoch {epoch+1}/{num_epochs} | "
-                   f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                   f"Ratio: {overfitting_ratio:.2f}x")
+        if annealing_mode:
+            logger.info(f"Epoch {epoch+1}/{num_epochs} | "
+                       f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
+                       f"Ratio: {overfitting_ratio:.2f}x | Annealing: {epochs_in_annealing}/{annealing_patience}")
+        else:
+            logger.info(f"Epoch {epoch+1}/{num_epochs} | "
+                       f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
+                       f"Ratio: {overfitting_ratio:.2f}x")
         
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_train_loss = train_loss
             plateau_counter = 0
+            
+            # If we're in annealing mode and found improvement, celebrate it
+            if annealing_mode:
+                logger.info(f"  ✓ Improvement found during annealing! Resetting counter.")
+                epochs_in_annealing = 0  # Reset annealing patience counter
             
             # Save checkpoint
             checkpoint = {
@@ -595,27 +595,44 @@ def main():
         else:
             plateau_counter += 1
             
-            # Update learning rate scheduler (called on each epoch)
-            lr_scheduler.step(val_loss)
-            current_lr = optimizer.param_groups[0]['lr']
+            # Track annealing mode
+            if annealing_mode:
+                epochs_in_annealing += 1
+                
+                # Check if annealing has gone on too long without improvement
+                if epochs_in_annealing >= annealing_patience:
+                    logger.info(f"\n⚠ ANNEALING FAILED: No improvement after {annealing_patience} epochs")
+                    logger.info(f"Stopping training at epoch {epoch+1}")
+                    logger.info(f"Best val loss achieved: {best_val_loss:.4f}")
+                    break
             
-            if current_lr < base_learning_rate:
-                lr_reduce_counter += 1
-                logger.info(f"  ⚠ LR Reduced: {current_lr:.2e} "
-                           f"(reduction #{lr_reduce_counter}, plateau {plateau_counter} epochs)")
-            
-            # Check for severe overfitting
-            if epoch >= min_epochs and overfitting_ratio > overfitting_threshold:
-                logger.info(f"\n⚠ SEVERE OVERFITTING DETECTED: {overfitting_ratio:.2f}x ratio")
-                logger.info(f"Stopping at epoch {epoch+1} to prevent further overfitting")
-                logger.info(f"Train loss: {train_loss:.4f} | Val loss: {val_loss:.4f}")
-                break
-            
-            # Also stop if plateau is too long even with LR reduction
-            if plateau_counter >= max_patience_on_plateau:
-                logger.info(f"\nValidation plateau detected ({plateau_counter} epochs without improvement)")
-                logger.info(f"Stopping to save training time (LR reduced {lr_reduce_counter} times)")
-                break
+            # Detect overfitting and trigger annealing if not already triggered
+            if (epoch >= min_epochs and 
+                overfitting_ratio > overfitting_threshold and 
+                not annealing_mode):
+                
+                annealing_mode = True
+                overfitting_detected_epoch = epoch
+                epochs_in_annealing = 0
+                
+                logger.info(f"\n⚠ OVERFITTING DETECTED: {overfitting_ratio:.2f}x ratio")
+                logger.info(f"  Triggering aggressive learning rate annealing")
+                logger.info(f"  Will attempt to recover for up to {annealing_patience} epochs")
+                
+                # Aggressively reduce learning rate
+                current_lr = optimizer.param_groups[0]['lr']
+                new_lr = current_lr * 0.1  # Reduce by 90% (10x reduction)
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = new_lr
+                
+                logger.info(f"  LR reduced: {current_lr:.2e} → {new_lr:.2e}")
+            elif annealing_mode and plateau_counter % 5 == 0:
+                # During annealing, reduce LR more gradually every 5 plateaus
+                current_lr = optimizer.param_groups[0]['lr']
+                new_lr = current_lr * 0.5
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = new_lr
+                logger.info(f"  ⚠ Further LR reduction during annealing: {new_lr:.2e}")
     
     logger.info("\n" + "="*80)
     logger.info("✓ TRAINING COMPLETE")
@@ -623,7 +640,9 @@ def main():
     logger.info(f"Best validation loss: {best_val_loss:.4f}")
     logger.info(f"Best train loss: {best_train_loss:.4f}")
     logger.info(f"Final overfitting ratio: {best_val_loss/best_train_loss:.2f}x")
-    logger.info(f"Learning rate reductions applied: {lr_reduce_counter}")
+    if annealing_mode:
+        logger.info(f"Annealing was triggered at epoch {overfitting_detected_epoch+1}")
+        logger.info(f"Survived {epochs_in_annealing}/{annealing_patience} annealing epochs")
     checkpoint_file = checkpoint_dir / f"{args.model}_best.pt"
     logger.info(f"Checkpoint saved: {checkpoint_file}")
 
