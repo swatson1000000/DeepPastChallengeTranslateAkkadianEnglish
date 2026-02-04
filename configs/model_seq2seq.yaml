@@ -1,0 +1,107 @@
+# Configuration for baseline Seq2Seq model with attention
+# Optimized for 75GB GPU memory
+
+model:
+  name: "seq2seq_attention"
+  
+  # Encoder configuration - scaled up for GPU
+  encoder:
+    type: "lstm"  # Options: lstm, gru
+    num_layers: 3
+    hidden_size: 768
+    embedding_size: 384
+    dropout: 0.2
+    bidirectional: true
+  
+  # Decoder configuration - scaled up for GPU
+  decoder:
+    type: "lstm"
+    num_layers: 3
+    hidden_size: 768
+    embedding_size: 384
+    dropout: 0.2
+  
+  # Attention configuration
+  attention:
+    type: "bahdanau"  # Options: bahdanau, luong
+    hidden_size: 768
+  
+  # General
+  device: "cuda"  # cuda or cpu
+  max_seq_length: 1024
+
+# Training configuration - GPU optimized for 200 epochs
+training:
+  batch_size: 128  # Reduced for better gradient flow
+  learning_rate: 0.0005  # Increased for faster convergence
+  weight_decay: 1e-4  # Increased regularization
+  epochs: 200  # Extended training for better convergence
+  max_grad_norm: 1.0  # Stricter gradient clipping
+  gradient_accumulation_steps: 2  # Accumulate gradients
+  use_mixed_precision: true
+  num_workers: 8
+  pin_memory: true
+  warmup_steps: 500  # Shorter warmup
+  optimizer: adamw
+  scheduler: cosine  # Better learning rate schedule
+  
+  # Learning rate scheduling
+  scheduler:
+    type: "warmup_linear"  # Options: constant, linear_decay, warmup_linear, cosine
+    warmup_steps: 4000
+    total_steps: 100000
+  
+  # Early stopping
+  early_stopping:
+    enabled: true
+    patience: 10
+    metric: "bleu"  # Options: loss, bleu, chrf
+    mode: "max"  # max or min
+  
+  # Validation
+  validation:
+    split: 0.1
+    evaluate_every: 1000
+    save_every: 5000
+    num_beams: 5
+
+# Data configuration
+data:
+  source_lang: "akkadian"
+  target_lang: "english"
+  source_file: "data/processed/train.akkadian"
+  target_file: "data/processed/train.english"
+  valid_source: "data/processed/valid.akkadian"
+  valid_target: "data/processed/valid.english"
+  test_file: "data/processed/test.akkadian"
+  
+  # Tokenization
+  tokenization:
+    type: "bpe"  # Options: bpe, word, character, sentencepiece
+    vocab_size: 10000
+    lowercase: false
+    remove_punctuation: false
+
+# Inference configuration
+inference:
+  beam_width: 5
+  length_penalty: 0.6
+  temperature: 1.0
+  top_k: 50
+  top_p: 0.95
+  max_length: 100
+  min_length: 1
+
+# Logging
+logging:
+  level: "INFO"
+  save_logs: true
+  log_dir: "results/training_logs"
+  tb_dir: "results/tensorboard"
+
+# Checkpointing
+checkpoint:
+  save_dir: "checkpoints"
+  keep_best: true
+  keep_last_n: 3
+  save_optimizer: true

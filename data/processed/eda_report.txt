@@ -1,0 +1,118 @@
+
+================================================================================
+                  AKKADIAN-ENGLISH TRANSLATION CORPUS ANALYSIS                  
+================================================================================
+
+Analysis Date: from EDA script
+Total training samples: 1561
+
+
+================================================================================
+                              TEXT LENGTH ANALYSIS                              
+================================================================================
+
+Source (Akkadian) Texts:
+  Characters: min=21, max=932, mean=426.46, median=365
+  Words: min=3, max=187, mean=57.53, median=49
+
+Target (English) Texts:
+  Characters: min=6, max=3895, mean=499.72, median=383
+  Words: min=1, max=744, mean=90.50, median=68
+
+================================================================================
+                           SPECIAL CHARACTER ANALYSIS                           
+================================================================================
+
+Total unique special characters: 8
+
+Top 30 special characters by frequency:
+   1. '.':   8625 occurrences
+   2. '…':   1687 occurrences
+   3. '(':   1103 occurrences
+   4. ')':   1098 occurrences
+   5. '[':    210 occurrences
+   6. ']':    210 occurrences
+   7. '+':     16 occurrences
+   8. '⌈':      1 occurrences
+
+================================================================================
+                             DETERMINATIVE ANALYSIS                             
+================================================================================
+
+Total unique determinatives: 0
+Total determinative occurrences: 0
+
+Determinatives by frequency:
+
+================================================================================
+                           PROPER NOUNS AND LOGOGRAMS                           
+================================================================================
+
+Total unique proper nouns: 8
+Total proper noun occurrences: 13
+Average occurrences per proper noun: 1.62
+
+Top 20 proper nouns:
+   1. A-                            :      6 occurrences
+   2. I-ba-ni                       :      1 occurrences
+   3. A-ta-a                        :      1 occurrences
+   4. A-ki                          :      1 occurrences
+   5. A-ma                          :      1 occurrences
+   6. A-ni-na                       :      1 occurrences
+   7. A-ri                          :      1 occurrences
+   8. A-nim                         :      1 occurrences
+
+
+Total unique Sumerian logograms: 151
+Total logogram occurrences: 11273
+
+Top 20 Sumerian logograms:
+   1. BABBAR                        :   3390 occurrences
+   2. DUMU                          :   1901 occurrences
+   3. IGI                           :   1128 occurrences
+   4. URUDU                         :    578 occurrences
+   5. AN.NA                         :    490 occurrences
+   6. DINGIR                        :    345 occurrences
+   7. SIG₅                          :    325 occurrences
+   8. TA                            :    255 occurrences
+   9. DU₁₀                          :    247 occurrences
+  10. PUZUR₄                        :    240 occurrences
+  11. KI                            :    210 occurrences
+  12. ITU.KAM                       :    200 occurrences
+  13. UTU                           :    188 occurrences
+  14. DAM.                          :    174 occurrences
+  15. BA                            :    144 occurrences
+  16. GAL                           :    138 occurrences
+  17. GI                            :    116 occurrences
+  18. DIRI                          :     88 occurrences
+  19. EN.                           :     82 occurrences
+  20. ITU.1.KAM                     :     79 occurrences
+
+================================================================================
+                               GAP/BREAK ANALYSIS                               
+================================================================================
+
+Texts with gaps/breaks: 0 / 1561 (0.0%)
+Total gaps found: 0
+
+
+================================================================================
+                             ENGLISH TEXT ANALYSIS                              
+================================================================================
+
+Texts with abbreviations: 810 / 1561 (51.9%)
+Total abbreviations found: 65
+
+Top 20 abbreviations:
+   1. III            :      8 occurrences
+   2. PN             :      8 occurrences
+   3. IV             :      7 occurrences
+   4. XI             :      7 occurrences
+   5. II             :      6 occurrences
+   6. IX             :      6 occurrences
+   7. VII            :      6 occurrences
+   8. XII            :      5 occurrences
+   9. VIII           :      5 occurrences
+  10. VI             :      4 occurrences
+  11. GA             :      2 occurrences
+  12. ME             :      1 occurrences

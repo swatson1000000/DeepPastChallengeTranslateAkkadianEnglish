@@ -1,0 +1,92 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Data files (keep structure, exclude large files)
+/data/raw/*.csv
+/data/processed/*.csv
+/data/augmented/
+
+# Model checkpoints and weights
+/checkpoints/*.pt
+/models/*.pt
+/models/mbart_checkpoints/
+/models/mbart50/
+/models/seq2seq/
+
+# Training logs
+/log/*.log
+*.log
+
+# Results and outputs
+/results/
+predictions.csv
+submission.csv
+
+# Temporary files
+*.tmp
+*.temp
+*.cache
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment files
+.env
+.env.local
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Archive and backup
+*.zip
+*.tar.gz
+*.bak
+*.backup
+
+# Kaggle API credentials (security)
+kaggle.json
+
+# Large data files
+*.pkl
+*.pickle
+*.h5
+*.hdf5
