@@ -397,7 +397,7 @@ def train_single(models, optimizer, criterion, config, args, device,
     fold_str = f"Fold {fold_idx + 1}" if fold_idx is not None else "Model"
     
     training_cfg = config.get('training', {})
-    batch_size = args.batch_size or training_cfg.get('batch_size', 256)
+    batch_size = args.batch_size or training_cfg.get('batch_size', 128)
     learning_rate = float(training_cfg.get('learning_rate', 0.0005))
     num_epochs = args.epochs or training_cfg.get('epochs', 100)
     
@@ -623,7 +623,7 @@ def main():
     
     # Training setup
     training_cfg = config.get('training', {})
-    batch_size = args.batch_size or training_cfg.get('batch_size', 256)
+    batch_size = args.batch_size or training_cfg.get('batch_size', 128)
     learning_rate = float(training_cfg.get('learning_rate', 0.0005))
     num_epochs = args.epochs or training_cfg.get('epochs', 100)
     early_stop_patience = 20  # Reduced to 20 to prevent overfitting
