@@ -434,6 +434,12 @@ def train_single(models, optimizer, criterion, config, args, device,
             use_tier2, copy_mechanism, lexicon_decoder
         )
         
+        # Log GPU memory usage
+        if device.type == 'cuda':
+            gpu_mem_used = torch.cuda.memory_allocated(device) / 1024**3
+            gpu_mem_reserved = torch.cuda.memory_reserved(device) / 1024**3
+            logger.debug(f"  GPU Memory: {gpu_mem_used:.1f}GB allocated, {gpu_mem_reserved:.1f}GB reserved")
+        
         overfitting_ratio = val_loss / train_loss if train_loss > 0 else float('inf')
         
         annealing_status = f" | Annealing: {epochs_in_annealing}/{annealing_patience}" if annealing_mode else ""
