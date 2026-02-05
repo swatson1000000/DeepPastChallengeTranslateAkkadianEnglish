@@ -20,10 +20,12 @@ import pandas as pd
 import yaml
 import sys
 import argparse
+import numpy as np
 from pathlib import Path
 from datetime import datetime
 from collections import Counter
 from typing import Dict, Tuple, Optional
+from sklearn.model_selection import KFold
 
 # Configure logging with unbuffered output
 logging.basicConfig(
@@ -380,6 +382,125 @@ def validate(models, criterion, val_data, batch_size, device,
     return total_loss / batch_count if batch_count > 0 else 0
 
 
+def train_single(models, optimizer, criterion, config, args, device,
+                train_src, train_tgt, val_src, val_tgt,
+                checkpoint_dir, use_tier2, copy_mechanism, lexicon_decoder,
+                fold_idx: Optional[int] = None) -> float:
+    """Train a single fold or the main model. Returns best validation loss."""
+    
+    fold_str = f"Fold {fold_idx + 1}" if fold_idx is not None else "Model"
+    
+    training_cfg = config.get('training', {})
+    batch_size = args.batch_size or training_cfg.get('batch_size', 32)
+    batch_size = 64
+    learning_rate = float(training_cfg.get('learning_rate', 0.0005))
+    num_epochs = args.epochs or training_cfg.get('epochs', 100)
+    
+    logger.info(f"\n{fold_str} | Train samples: {len(train_src)}, Val samples: {len(val_src)}")
+    
+    # Setup optimizer
+    optimizer = torch.optim.Adam(
+        [p for m in models for p in m.parameters()] +
+        ([p for p in copy_mechanism.parameters()] if copy_mechanism else []) +
+        ([p for p in lexicon_decoder.parameters()] if lexicon_decoder else []),
+        lr=learning_rate
+    )
+    
+    best_val_loss = float('inf')
+    best_train_loss = float('inf')
+    annealing_mode = False
+    epochs_in_annealing = 0
+    anneal_lr_reduction_steps = 0
+    
+    overfitting_threshold = 1.5
+    min_epochs = 15
+    annealing_patience = 50
+    
+    for epoch in range(num_epochs):
+        train_loss = train_epoch(
+            models, optimizer, criterion,
+            (train_src, train_tgt), batch_size, device,
+            use_tier2, copy_mechanism, lexicon_decoder
+        )
+        
+        val_loss = validate(
+            models, criterion,
+            (val_src, val_tgt), batch_size, device,
+            use_tier2, copy_mechanism, lexicon_decoder
+        )
+        
+        overfitting_ratio = val_loss / train_loss if train_loss > 0 else float('inf')
+        
+        annealing_status = f" | Annealing: {epochs_in_annealing}/{annealing_patience}" if annealing_mode else ""
+        logger.info(f"{fold_str} | Epoch {epoch+1:3d}/{num_epochs} | "
+                   f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
+                   f"Ratio: {overfitting_ratio:.2f}x{annealing_status}")
+        
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_train_loss = train_loss
+            
+            if annealing_mode:
+                logger.info(f"  ✓ Improvement found during annealing! Resetting counter.")
+                epochs_in_annealing = 0
+            
+            # Save checkpoint
+            checkpoint = {
+                'embedding': models[0].state_dict(),
+                'rnn': models[1].state_dict(),
+                'attention': models[2].state_dict(),
+                'decoder': models[3].state_dict(),
+            }
+            if copy_mechanism:
+                checkpoint['copy_mechanism'] = copy_mechanism.state_dict()
+            if lexicon_decoder:
+                checkpoint['lexicon_decoder'] = lexicon_decoder.state_dict()
+            
+            if fold_idx is not None:
+                fold_dir = checkpoint_dir / f"fold_{fold_idx}"
+                fold_dir.mkdir(parents=True, exist_ok=True)
+                torch.save(checkpoint, fold_dir / "best_model.pt")
+            else:
+                torch.save(checkpoint, checkpoint_dir / f"{args.model}_best.pt")
+            logger.info(f"  ✓ Saved best model (val loss: {val_loss:.4f})")
+        else:
+            if annealing_mode:
+                epochs_in_annealing += 1
+                
+                if epochs_in_annealing % 5 == 0 and anneal_lr_reduction_steps < 4:
+                    anneal_lr_reduction_steps += 1
+                    current_lr = optimizer.param_groups[0]['lr']
+                    new_lr = current_lr * 0.7
+                    for param_group in optimizer.param_groups:
+                        param_group['lr'] = new_lr
+                    logger.info(f"  ⚠ Annealing step {anneal_lr_reduction_steps}: LR → {new_lr:.2e}")
+                
+                if epochs_in_annealing >= annealing_patience:
+                    logger.info(f"  Early stopping: No improvement after {annealing_patience} annealing epochs")
+                    break
+            
+            if (epoch >= min_epochs and 
+                overfitting_ratio > overfitting_threshold and 
+                not annealing_mode):
+                
+                annealing_mode = True
+                epochs_in_annealing = 0
+                anneal_lr_reduction_steps = 0
+                
+                logger.info(f"\n⚠ OVERFITTING DETECTED: {overfitting_ratio:.2f}x ratio at epoch {epoch+1}")
+                logger.info(f"  Triggering gradual learning rate annealing")
+                logger.info(f"  Will attempt to recover for up to {annealing_patience} epochs")
+                
+                current_lr = optimizer.param_groups[0]['lr']
+                new_lr = current_lr * 0.5
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = new_lr
+                
+                logger.info(f"  Initial LR reduction: {current_lr:.2e} → {new_lr:.2e}")
+    
+    return best_val_loss
+
+
 def main():
     parser = argparse.ArgumentParser(description='Train Akkadian-English translation model')
     parser.add_argument('--model', choices=['baseline', 'improved', 'tier2', 'tier3'], default='improved',
@@ -392,6 +513,7 @@ def main():
     parser.add_argument('--data-path', type=str, default='data/processed/train_augmented.csv',
                        help='Path to training data')
     parser.add_argument('--config', type=str, default=None, help='Config file path')
+    parser.add_argument('--folds', type=int, default=None, help='Number of k-folds (if None, uses 80/20 split)')
     args = parser.parse_args()
     
     logger.info("="*80)
@@ -495,13 +617,6 @@ def main():
     num_epochs = args.epochs or training_cfg.get('epochs', 100)
     early_stop_patience = 20  # Reduced to 20 to prevent overfitting
     
-    models = [embedding, rnn, attention, decoder]
-    optimizer = torch.optim.Adam(
-        [p for m in models for p in m.parameters()] +
-        ([p for p in copy_mechanism.parameters()] if copy_mechanism else []) +
-        ([p for p in lexicon_decoder.parameters()] if lexicon_decoder else []),
-        lr=learning_rate
-    )
     criterion = nn.CrossEntropyLoss(ignore_index=0)
     
     logger.info(f"\nTraining config:")
@@ -510,141 +625,110 @@ def main():
     logger.info(f"  Epochs: {num_epochs}")
     logger.info(f"  Early stopping: {early_stop_patience} epochs")
     
-    # Split data (80/20)
-    num_train = int(len(df) * 0.8)
-    train_src, train_tgt = src_data[:num_train], tgt_data[:num_train]
-    val_src, val_tgt = src_data[num_train:], tgt_data[num_train:]
-    
-    logger.info(f"  Train samples: {len(train_src)}")
-    logger.info(f"  Val samples: {len(val_src)}")
-    
-    # Training loop configuration
     checkpoint_dir = project_root / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     
-    best_val_loss = float('inf')
-    best_train_loss = float('inf')
-    plateau_counter = 0  # Counts epochs without validation improvement
-    annealing_mode = False  # Whether we've triggered annealing due to overfitting
-    epochs_in_annealing = 0  # Epochs since annealing was triggered
-    overfitting_detected_epoch = -1  # When overfitting was first detected
-    base_learning_rate = learning_rate
-    anneal_lr_reduction_steps = 0  # Track how many times we've reduced LR during annealing
-    
-    # Overfitting detection thresholds
-    overfitting_threshold = 1.5  # Trigger annealing when ratio exceeds 1.5x
-    min_epochs = 15  # Don't trigger annealing before this
-    annealing_patience = 50  # If annealing doesn't help in 50 epochs, quit
-    
-    logger.info("\n" + "="*80)
-    logger.info("STARTING TRAINING (Annealing-Based Strategy)")
-    logger.info("="*80)
-    logger.info(f"  Overfitting threshold: {overfitting_threshold}x (triggers annealing)")
-    logger.info(f"  Annealing patience: {annealing_patience} epochs")
-    logger.info(f"  If no improvement after annealing, stop training")
-    logger.info("="*80 + "\n")
-    
-    for epoch in range(num_epochs):
-        train_loss = train_epoch(
-            models, optimizer, criterion,
-            (train_src, train_tgt), batch_size, device,
-            use_tier2, copy_mechanism, lexicon_decoder
+    # K-Fold or Regular Training
+    if args.folds:
+        # K-Fold Cross-Validation
+        logger.info(f"\n{'='*80}")
+        logger.info(f"K-FOLD CROSS-VALIDATION: {args.folds} FOLDS")
+        logger.info(f"{'='*80}")
+        
+        kfold = KFold(n_splits=args.folds, shuffle=True, random_state=42)
+        fold_results = []
+        
+        for fold_idx, (train_indices, val_indices) in enumerate(kfold.split(np.arange(len(df)))):
+            logger.info(f"\n{'='*80}")
+            logger.info(f"FOLD {fold_idx + 1}/{args.folds}")
+            logger.info(f"{'='*80}")
+            
+            # Get fold data
+            fold_train_src = src_data[train_indices]
+            fold_train_tgt = tgt_data[train_indices]
+            fold_val_src = src_data[val_indices]
+            fold_val_tgt = tgt_data[val_indices]
+            
+            # Create fresh models for this fold
+            fold_embedding = nn.Embedding(len(src_tokenizer), embedding_dim).to(device)
+            fold_rnn = nn.LSTM(embedding_dim, hidden_dim, num_layers, batch_first=True,
+                              dropout=dropout_rate if num_layers > 1 else 0).to(device)
+            fold_attention = AttentionLayer(hidden_dim).to(device)
+            fold_decoder = nn.Linear(hidden_dim * 2, len(tgt_tokenizer)).to(device)
+            
+            fold_models = [fold_embedding, fold_rnn, fold_attention, fold_decoder]
+            
+            # TIER 2 components for this fold
+            fold_copy_mechanism = None
+            fold_lexicon_decoder = None
+            
+            if use_tier2 or args.use_copy:
+                fold_copy_mechanism = CopyMechanism(hidden_dim, len(tgt_tokenizer)).to(device)
+            
+            if use_tier2 or args.use_lexicon:
+                fold_lexicon_decoder = LexiconConstrainedDecoder(len(tgt_tokenizer), lexicon_mask).to(device)
+            
+            # Train this fold
+            best_val_loss = train_single(
+                fold_models,  # Dummy optimizer, will be created in train_single
+                None,  # Will be created in train_single
+                criterion,
+                config, args, device,
+                fold_train_src, fold_train_tgt, fold_val_src, fold_val_tgt,
+                checkpoint_dir, use_tier2, fold_copy_mechanism, fold_lexicon_decoder,
+                fold_idx=fold_idx
+            )
+            
+            fold_results.append({
+                'fold': fold_idx + 1,
+                'val_loss': best_val_loss
+            })
+            
+            logger.info(f"\n✓ Fold {fold_idx + 1} complete: Best val loss {best_val_loss:.4f}\n")
+        
+        # K-Fold Summary
+        logger.info(f"\n{'='*80}")
+        logger.info("K-FOLD CROSS-VALIDATION COMPLETE")
+        logger.info(f"{'='*80}")
+        logger.info("\nFold Results:")
+        for result in fold_results:
+            logger.info(f"  Fold {result['fold']}: Val Loss = {result['val_loss']:.4f}")
+        
+        avg_loss = np.mean([r['val_loss'] for r in fold_results])
+        std_loss = np.std([r['val_loss'] for r in fold_results])
+        logger.info(f"\nAverage Val Loss: {avg_loss:.4f} ± {std_loss:.4f}")
+        logger.info(f"Best Fold: {min(fold_results, key=lambda x: x['val_loss'])['fold']} "
+                   f"(Loss: {min(fold_results, key=lambda x: x['val_loss'])['val_loss']:.4f})")
+        logger.info(f"\n✓ Fold checkpoints saved to: checkpoints/fold_*")
+        
+    else:
+        # Regular Training (80/20 split)
+        logger.info(f"\n{'='*80}")
+        logger.info("REGULAR TRAINING (80/20 Split)")
+        logger.info(f"{'='*80}")
+        
+        # Split data (80/20)
+        num_train = int(len(df) * 0.8)
+        train_src, train_tgt = src_data[:num_train], tgt_data[:num_train]
+        val_src, val_tgt = src_data[num_train:], tgt_data[num_train:]
+        
+        # Create model
+        models = [embedding, rnn, attention, decoder]
+        
+        logger.info(f"  Train samples: {len(train_src)}")
+        logger.info(f"  Val samples: {len(val_src)}")
+        
+        # Train the model
+        best_val_loss = train_single(
+            models, optimizer, criterion, config, args, device,
+            train_src, train_tgt, val_src, val_tgt,
+            checkpoint_dir, use_tier2, copy_mechanism, lexicon_decoder
         )
         
-        val_loss = validate(
-            models, criterion,
-            (val_src, val_tgt), batch_size, device,
-            use_tier2, copy_mechanism, lexicon_decoder
-        )
-        
-        # Calculate overfitting ratio
-        overfitting_ratio = val_loss / train_loss if train_loss > 0 else float('inf')
-        
-        if annealing_mode:
-            logger.info(f"Epoch {epoch+1}/{num_epochs} | "
-                       f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                       f"Ratio: {overfitting_ratio:.2f}x | Annealing: {epochs_in_annealing}/{annealing_patience}")
-        else:
-            logger.info(f"Epoch {epoch+1}/{num_epochs} | "
-                       f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                       f"Ratio: {overfitting_ratio:.2f}x")
-        
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_train_loss = train_loss
-            plateau_counter = 0
-            
-            # If we're in annealing mode and found improvement, celebrate it
-            if annealing_mode:
-                logger.info(f"  ✓ Improvement found during annealing! Resetting counter.")
-                epochs_in_annealing = 0  # Reset annealing patience counter
-            
-            # Save checkpoint
-            checkpoint = {
-                'embedding': embedding.state_dict(),
-                'rnn': rnn.state_dict(),
-                'attention': attention.state_dict(),
-                'decoder': decoder.state_dict(),
-            }
-            if copy_mechanism:
-                checkpoint['copy_mechanism'] = copy_mechanism.state_dict()
-            if lexicon_decoder:
-                checkpoint['lexicon_decoder'] = lexicon_decoder.state_dict()
-            
-            torch.save(checkpoint, checkpoint_dir / f"{args.model}_best.pt")
-            logger.info(f"  ✓ Saved best model (val loss: {val_loss:.4f})")
-        else:
-            plateau_counter += 1
-            
-            # Track annealing mode
-            if annealing_mode:
-                epochs_in_annealing += 1
-                
-                # Gradually reduce LR every 5 epochs during annealing (gentler approach)
-                if epochs_in_annealing % 5 == 0 and anneal_lr_reduction_steps < 4:
-                    anneal_lr_reduction_steps += 1
-                    current_lr = optimizer.param_groups[0]['lr']
-                    new_lr = current_lr * 0.7  # Reduce by 30% (more gradual)
-                    for param_group in optimizer.param_groups:
-                        param_group['lr'] = new_lr
-                    logger.info(f"  ⚠ Annealing step {anneal_lr_reduction_steps}: LR → {new_lr:.2e}")
-                
-                # Check if annealing has gone on too long without improvement
-                if epochs_in_annealing >= annealing_patience:
-                    logger.info(f"\n⚠ ANNEALING FAILED: No improvement after {annealing_patience} epochs")
-                    logger.info(f"Stopping training at epoch {epoch+1}")
-                    logger.info(f"Best val loss achieved: {best_val_loss:.4f}")
-                    break
-            
-            # Detect overfitting and trigger annealing if not already triggered
-            if (epoch >= min_epochs and 
-                overfitting_ratio > overfitting_threshold and 
-                not annealing_mode):
-                
-                annealing_mode = True
-                overfitting_detected_epoch = epoch
-                epochs_in_annealing = 0
-                anneal_lr_reduction_steps = 0
-                
-                logger.info(f"\n⚠ OVERFITTING DETECTED: {overfitting_ratio:.2f}x ratio at epoch {epoch+1}")
-                logger.info(f"  Triggering gradual learning rate annealing")
-                logger.info(f"  Will attempt to recover for up to {annealing_patience} epochs")
-                logger.info(f"  Strategy: Reduce LR by 30% every 5 epochs (gentler than 10x)")
-                
-                # Moderately reduce learning rate (gentler initial reduction)
-                current_lr = optimizer.param_groups[0]['lr']
-                new_lr = current_lr * 0.5  # Reduce by 50% initially (5x reduction, more reasonable)
-                for param_group in optimizer.param_groups:
-                    param_group['lr'] = new_lr
-                
-                logger.info(f"  Initial LR reduction: {current_lr:.2e} → {new_lr:.2e}")
-    
-    logger.info("\n" + "="*80)
-    logger.info("✓ TRAINING COMPLETE")
-    logger.info("="*80)
-    logger.info(f"Best validation loss: {best_val_loss:.4f}")
-    logger.info(f"Best train loss: {best_train_loss:.4f}")
-    logger.info(f"Final overfitting ratio: {best_val_loss/best_train_loss:.2f}x")
+        logger.info("\n" + "="*80)
+        logger.info("✓ TRAINING COMPLETE")
+        logger.info("="*80)
+        logger.info(f"Best validation loss: {best_val_loss:.4f}")
     if annealing_mode:
         logger.info(f"Annealing was triggered at epoch {overfitting_detected_epoch+1}")
         logger.info(f"Survived {epochs_in_annealing}/{annealing_patience} annealing epochs")
