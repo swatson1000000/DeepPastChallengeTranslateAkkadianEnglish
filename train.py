@@ -518,7 +518,7 @@ def main():
     logger.info(f"  Train samples: {len(train_src)}")
     logger.info(f"  Val samples: {len(val_src)}")
     
-    # Training loop
+    # Training loop configuration
     checkpoint_dir = project_root / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     
@@ -529,6 +529,7 @@ def main():
     epochs_in_annealing = 0  # Epochs since annealing was triggered
     overfitting_detected_epoch = -1  # When overfitting was first detected
     base_learning_rate = learning_rate
+    anneal_lr_reduction_steps = 0  # Track how many times we've reduced LR during annealing
     
     # Overfitting detection thresholds
     overfitting_threshold = 1.5  # Trigger annealing when ratio exceeds 1.5x
@@ -599,6 +600,15 @@ def main():
             if annealing_mode:
                 epochs_in_annealing += 1
                 
+                # Gradually reduce LR every 5 epochs during annealing (gentler approach)
+                if epochs_in_annealing % 5 == 0 and anneal_lr_reduction_steps < 4:
+                    anneal_lr_reduction_steps += 1
+                    current_lr = optimizer.param_groups[0]['lr']
+                    new_lr = current_lr * 0.7  # Reduce by 30% (more gradual)
+                    for param_group in optimizer.param_groups:
+                        param_group['lr'] = new_lr
+                    logger.info(f"  ⚠ Annealing step {anneal_lr_reduction_steps}: LR → {new_lr:.2e}")
+                
                 # Check if annealing has gone on too long without improvement
                 if epochs_in_annealing >= annealing_patience:
                     logger.info(f"\n⚠ ANNEALING FAILED: No improvement after {annealing_patience} epochs")
@@ -614,25 +624,20 @@ def main():
                 annealing_mode = True
                 overfitting_detected_epoch = epoch
                 epochs_in_annealing = 0
+                anneal_lr_reduction_steps = 0
                 
-                logger.info(f"\n⚠ OVERFITTING DETECTED: {overfitting_ratio:.2f}x ratio")
-                logger.info(f"  Triggering aggressive learning rate annealing")
+                logger.info(f"\n⚠ OVERFITTING DETECTED: {overfitting_ratio:.2f}x ratio at epoch {epoch+1}")
+                logger.info(f"  Triggering gradual learning rate annealing")
                 logger.info(f"  Will attempt to recover for up to {annealing_patience} epochs")
+                logger.info(f"  Strategy: Reduce LR by 30% every 5 epochs (gentler than 10x)")
                 
-                # Aggressively reduce learning rate
+                # Moderately reduce learning rate (gentler initial reduction)
                 current_lr = optimizer.param_groups[0]['lr']
-                new_lr = current_lr * 0.1  # Reduce by 90% (10x reduction)
+                new_lr = current_lr * 0.5  # Reduce by 50% initially (5x reduction, more reasonable)
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = new_lr
                 
-                logger.info(f"  LR reduced: {current_lr:.2e} → {new_lr:.2e}")
-            elif annealing_mode and plateau_counter % 5 == 0:
-                # During annealing, reduce LR more gradually every 5 plateaus
-                current_lr = optimizer.param_groups[0]['lr']
-                new_lr = current_lr * 0.5
-                for param_group in optimizer.param_groups:
-                    param_group['lr'] = new_lr
-                logger.info(f"  ⚠ Further LR reduction during annealing: {new_lr:.2e}")
+                logger.info(f"  Initial LR reduction: {current_lr:.2e} → {new_lr:.2e}")
     
     logger.info("\n" + "="*80)
     logger.info("✓ TRAINING COMPLETE")
