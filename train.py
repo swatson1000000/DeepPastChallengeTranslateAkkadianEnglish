@@ -303,8 +303,9 @@ def train_epoch(models, optimizer, criterion, train_data, batch_size, device,
             continue
         
         loss.backward()
-        grad_params = (list(embedding.parameters()) + list(rnn.parameters()) +
-                      list(attention.parameters()) + list(decoder.parameters()))
+        grad_params = (list(embedding.parameters()) + list(tgt_embedding.parameters()) + 
+                      list(rnn.parameters()) + list(attention.parameters()) + 
+                      list(decoder.parameters()))
         if copy_mechanism is not None:
             grad_params.extend(list(copy_mechanism.parameters()))
         if lexicon_decoder is not None:
@@ -378,8 +379,11 @@ def validate(models, criterion, val_data, batch_size, device,
                 loss += criterion(logits, target)
             
             loss = loss / tgt_batch.shape[1]
-            total_loss += loss.item()
-            batch_count += 1
+            
+            # Check for NaN and skip batch if detected
+            if not torch.isnan(loss):
+                total_loss += loss.item()
+                batch_count += 1
     
     return total_loss / batch_count if batch_count > 0 else 0
 
