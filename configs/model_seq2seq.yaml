@@ -32,7 +32,7 @@ model:
 
 # Training configuration - GPU optimized for 200 epochs
 training:
-  batch_size: 128  # Reduced for better gradient flow
+  batch_size: 64  # Reduced from 128 to save ~50% GPU memory on tensor allocations
   learning_rate: 0.0005  # Increased for faster convergence
   weight_decay: 1e-4  # Increased regularization
   epochs: 200  # Extended training for better convergence

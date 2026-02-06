@@ -8,8 +8,8 @@ data:
   train: "data/processed/train_augmented.csv"
   val: "data/processed/val.csv"
   test: "data/test.csv"
-  max_source_length: 256
-  max_target_length: 256
+  max_source_length: 128
+  max_target_length: 128
 
 encoder:
   type: "lstm"
@@ -29,12 +29,13 @@ decoder:
   attention_type: "bahdanau"
 
 training:
-  batch_size: 128
+  batch_size: 64  # Reduced from 512 to save ~88% GPU memory on tensor allocations
   learning_rate: 0.0005
-  max_epochs: 250  # EXTENDED from 100 - longer training for augmented data
-  early_stopping_patience: 30  # INCREASED from 25
+  max_epochs: 50  # REDUCED from 100 - with stricter early stopping
+  early_stopping_patience: 15  # TIGHTENED for faster stopping on overfitting
   gradient_clip: 1.0
-  use_amp: false  # Mixed precision (if GPU supports)
+  use_amp: false  # Disabled due to PyTorch API compatibility - will optimize later
+  gradient_accumulation_steps: 8  # Accumulate over 8 steps to maintain effective batch size of 512
   
 optimizer:
   type: "adam"

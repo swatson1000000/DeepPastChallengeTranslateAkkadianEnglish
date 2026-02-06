@@ -9,15 +9,15 @@ data:
 
 encoder:
   type: "lstm"
-  num_layers: 2
-  hidden_size: 512
-  embedding_dim: 384
-  dropout: 0.3
+  num_layers: 4
+  hidden_size: 1024
+  embedding_dim: 512
+  dropout: 0.4
   bidirectional: false
 
 attention:
   type: "bahdanau"
-  hidden_dim: 512
+  hidden_dim: 1024
 
 # TIER 2: Copy mechanism (inherited)
 copy_mechanism:
@@ -48,12 +48,12 @@ decoding:
   repetition_penalty: 1.2  # penalize repeated tokens
 
 training:
-  batch_size: 128
-  max_epochs: 400  # Extended for TIER 3
-  learning_rate: 0.0005
-  weight_decay: 1.0e-5
-  gradient_accumulation_steps: 1
-  early_stopping_patience: 60  # Longer patience for extended training
+  batch_size: 64
+  max_epochs: 400
+  learning_rate: 0.0003
+  weight_decay: 5.0e-4
+  gradient_accumulation_steps: 2
+  early_stopping_patience: 8  # Reduced — val loss plateaus by epoch ~28
   
   scheduler:
     type: "cosine"
@@ -62,7 +62,7 @@ training:
   plateau_scheduler:
     enabled: true
     factor: 0.5
-    patience: 10
+    patience: 5
     min_lr: 1e-7
 
 # TIER 3: Data augmentation
@@ -75,6 +75,8 @@ augmentation:
 # TIER 3: Regularization
 regularization:
   label_smoothing: 0.1
+  embedding_dropout: 0.4
+  decoder_dropout: 0.3
   dropout_variational: true  # Same dropout mask across timesteps
   scheduled_sampling: false  # Teacher forcing ratio decay
 

@@ -33,11 +33,11 @@ lexicon_constraints:
   fallback_to_generation: true  # If no valid copy, generate from vocab
 
 training:
-  batch_size: 128
+  batch_size: 64  # Reduced from 128 to save ~50% GPU memory on tensor allocations
   max_epochs: 300  # Extended training with TIER 2
   learning_rate: 0.0005
   weight_decay: 1.0e-5
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 2  # Accumulate gradients over 2 steps to maintain effective batch size of 128
   early_stopping_patience: 50  # Longer patience for complex TIER 2 training
   
   # Learning rate scheduling

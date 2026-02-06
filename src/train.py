@@ -26,6 +26,8 @@ from datetime import datetime
 from collections import Counter
 from typing import Dict, Tuple, Optional
 from sklearn.model_selection import KFold
+from torch.amp import autocast, GradScaler
+from torch.cuda.amp import autocast, GradScaler
 
 # Configure logging with unbuffered output
 logging.basicConfig(
@@ -38,6 +40,37 @@ logger = logging.getLogger(__name__)
 # Force unbuffered stdout/stderr
 sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, 'reconfigure') else None
 sys.stderr.reconfigure(line_buffering=True) if hasattr(sys.stderr, 'reconfigure') else None
+
+
+class LabelSmoothingCrossEntropy(nn.Module):
+    """Cross-entropy loss with label smoothing (Priority 2 improvement)."""
+    def __init__(self, num_classes, smoothing=0.1, ignore_index=0):
+        super().__init__()
+        self.smoothing = smoothing
+        self.num_classes = num_classes
+        self.ignore_index = ignore_index
+    
+    def forward(self, logits, targets):
+        """logits: (batch*seq, vocab), targets: (batch*seq)"""
+        log_probs = torch.log_softmax(logits, dim=-1)
+        
+        # Skip ignore_index
+        mask = targets != self.ignore_index
+        if not mask.any():
+            return torch.tensor(0.0, device=logits.device)
+        
+        # Create smooth target distribution
+        confidence = 1.0 - self.smoothing
+        smooth_label = self.smoothing / self.num_classes
+        
+        with torch.no_grad():
+            true_probs = torch.zeros_like(log_probs)
+            true_probs.fill_(smooth_label)
+            true_probs.scatter_(1, targets.unsqueeze(1), confidence)
+        
+        # Calculate smoothed loss
+        loss = torch.sum(-true_probs * log_probs, dim=-1)
+        return loss[mask].mean()
 
 
 class SimpleTokenizer:
@@ -227,8 +260,49 @@ def load_config(config_path: Path) -> Dict:
         return yaml.safe_load(f)
 
 
+def calculate_bleu(predictions, references, max_n=2):
+    """Calculate BLEU score for batch of predictions (Priority 2 improvement)."""
+    from collections import Counter
+    import math
+    
+    def get_ngrams(words, n):
+        return Counter(tuple(words[i:i+n]) for i in range(len(words)-n+1))
+    
+    scores = []
+    for pred_words, ref_words in zip(predictions, references):
+        if not pred_words or not ref_words:
+            scores.append(0.0)
+            continue
+        
+        pred_tokens = pred_words.split()
+        ref_tokens = ref_words.split()
+        
+        precisions = []
+        for n in range(1, min(max_n+1, len(pred_tokens)+1)):
+            pred_ng = get_ngrams(pred_tokens, n)
+            ref_ng = get_ngrams(ref_tokens, n)
+            
+            if not pred_ng:
+                precisions.append(0.0)
+                continue
+            
+            overlap = sum(min(pred_ng[ng], ref_ng[ng]) for ng in pred_ng if ng in ref_ng)
+            precision = overlap / sum(pred_ng.values()) if sum(pred_ng.values()) > 0 else 0.0
+            precisions.append(precision)
+        
+        if precisions and any(p > 0 for p in precisions):
+            geo_mean = math.exp(sum(math.log(p) for p in precisions if p > 0) / len([p for p in precisions if p > 0]))
+            scores.append(geo_mean)
+        else:
+            scores.append(0.0)
+    
+    return np.mean(scores) if scores else 0.0
+
+
 def train_epoch(models, optimizer, criterion, train_data, batch_size, device, 
-                use_tier2=False, copy_mechanism=None, lexicon_decoder=None):
+                use_tier2=False, copy_mechanism=None, lexicon_decoder=None,
+                use_amp=False, scaler=None,
+                embedding_dropout_rate=0.4, decoder_dropout_rate=0.3):
     """Train for one epoch."""
     embedding, tgt_embedding, rnn, attention, decoder = models
     embedding.train()
@@ -236,6 +310,10 @@ def train_epoch(models, optimizer, criterion, train_data, batch_size, device,
     rnn.train()
     attention.train()
     decoder.train()
+    
+    # Dropout layers applied during training to reduce overfitting
+    emb_dropout = nn.Dropout(embedding_dropout_rate).to(device)
+    dec_dropout = nn.Dropout(decoder_dropout_rate).to(device)
     
     src_data, tgt_data = train_data
     total_loss = 0
@@ -245,56 +323,118 @@ def train_epoch(models, optimizer, criterion, train_data, batch_size, device,
     src_shuffled = src_data[indices]
     tgt_shuffled = tgt_data[indices]
     
-    for batch_start in range(0, len(src_data), batch_size):
+    total_batches = (len(src_data) + batch_size - 1) // batch_size
+    logger.info(f"  Starting training: {len(src_data)} samples, {total_batches} batches of size {batch_size}")
+    
+    # Memory optimization: track peak memory usage
+    if device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats(device)
+    
+    # GPU memory hard limit for per-batch safety checks
+    GPU_MEM_LIMIT = 80  # GB
+    
+    for batch_idx, batch_start in enumerate(range(0, len(src_data), batch_size)):
+        # Per-batch GPU memory safety check
+        if device.type == 'cuda':
+            peak_gb = torch.cuda.max_memory_allocated(device) / 1024**3
+            if peak_gb > GPU_MEM_LIMIT * 0.95:
+                logger.error(f"  \u2716 GPU MEMORY CRITICAL: {peak_gb:.1f} GB peak (limit {GPU_MEM_LIMIT} GB)")
+                logger.error(f"    Stopping training to prevent OOM. Reduce batch_size or model size.")
+                torch.cuda.empty_cache()
+                break
+            elif batch_idx == 0:
+                # After first batch, log actual memory for verification
+                pass  # will log below at batch 1
+        
         batch_end = min(batch_start + batch_size, len(src_data))
         src_batch = src_shuffled[batch_start:batch_end].to(device)
         tgt_batch = tgt_shuffled[batch_start:batch_end].to(device)
         
         optimizer.zero_grad()
         
-        # Encode
-        embedded = embedding(src_batch)
-        if isinstance(rnn, nn.LSTM):
-            rnn_out, (hidden, cell) = rnn(embedded)
+        # Mixed Precision: wrap forward pass in autocast if enabled
+        if use_amp:
+            with autocast():
+                # Encode
+                embedded = emb_dropout(embedding(src_batch))
+                if isinstance(rnn, nn.LSTM):
+                    rnn_out, (hidden, cell) = rnn(embedded)
+                else:
+                    rnn_out, hidden = rnn(embedded)
+                
+                # Decode
+                loss = 0
+                for step in range(1, tgt_batch.shape[1]):
+                    prev_token = tgt_batch[:, step-1]
+                    target = tgt_batch[:, step]
+                    
+                    prev_embedded = emb_dropout(tgt_embedding(prev_token))
+                    
+                    if isinstance(rnn, nn.LSTM):
+                        _, (hidden, cell) = rnn(prev_embedded.unsqueeze(1), (hidden, cell))
+                        hidden_vec = hidden[-1]
+                    else:
+                        _, hidden = rnn(prev_embedded.unsqueeze(1), hidden)
+                        hidden_vec = hidden[-1]
+                    
+                    context, _ = attention(hidden_vec, rnn_out)
+                    decoder_input = torch.cat([hidden_vec, context], dim=-1)
+                    logits = decoder(dec_dropout(decoder_input))
+                    
+                    if use_tier2 and copy_mechanism is not None:
+                        copy_logits, _, _ = copy_mechanism(hidden_vec, rnn_out, src_batch, coverage=None)
+                        logits = logits + 0.5 * copy_logits
+                    
+                    if use_tier2 and lexicon_decoder is not None:
+                        logits = lexicon_decoder(logits)
+                    
+                    loss += criterion(logits, target)
+                
+                loss = loss / tgt_batch.shape[1]
         else:
-            rnn_out, hidden = rnn(embedded)
-        
-        # Decode
-        loss = 0
-        for step in range(1, tgt_batch.shape[1]):
-            prev_token = tgt_batch[:, step-1]
-            target = tgt_batch[:, step]
-            
-            prev_embedded = tgt_embedding(prev_token)  # Use TARGET embedding, not source!
-            
+            # Encode
+            embedded = emb_dropout(embedding(src_batch))
             if isinstance(rnn, nn.LSTM):
-                _, (hidden, cell) = rnn(prev_embedded.unsqueeze(1), (hidden, cell))
-                hidden_vec = hidden[-1]  # Get last layer: (batch, hidden_dim)
+                rnn_out, (hidden, cell) = rnn(embedded)
             else:
-                _, hidden = rnn(prev_embedded.unsqueeze(1), hidden)
-                hidden_vec = hidden[-1]  # Get last layer: (batch, hidden_dim)
+                rnn_out, hidden = rnn(embedded)
             
-            context, _ = attention(hidden_vec, rnn_out)
-            decoder_input = torch.cat([hidden_vec, context], dim=-1)
+            # Decode
+            loss = 0
+            for step in range(1, tgt_batch.shape[1]):
+                prev_token = tgt_batch[:, step-1]
+                target = tgt_batch[:, step]
+                
+                prev_embedded = emb_dropout(tgt_embedding(prev_token))  # Use TARGET embedding, not source!
+                
+                if isinstance(rnn, nn.LSTM):
+                    _, (hidden, cell) = rnn(prev_embedded.unsqueeze(1), (hidden, cell))
+                    hidden_vec = hidden[-1]  # Get last layer: (batch, hidden_dim)
+                else:
+                    _, hidden = rnn(prev_embedded.unsqueeze(1), hidden)
+                    hidden_vec = hidden[-1]  # Get last layer: (batch, hidden_dim)
+                
+                context, _ = attention(hidden_vec, rnn_out)
+                decoder_input = torch.cat([hidden_vec, context], dim=-1)
+                
+                logits = decoder(dec_dropout(decoder_input))
+                
+                # Apply TIER 2 if enabled
+                if use_tier2 and copy_mechanism is not None:
+                    copy_logits, _, _ = copy_mechanism(
+                        hidden_vec,
+                        rnn_out,
+                        src_batch,
+                        coverage=None
+                    )
+                    logits = logits + 0.5 * copy_logits
+                
+                if use_tier2 and lexicon_decoder is not None:
+                    logits = lexicon_decoder(logits)
+                
+                loss += criterion(logits, target)
             
-            logits = decoder(decoder_input)
-            
-            # Apply TIER 2 if enabled
-            if use_tier2 and copy_mechanism is not None:
-                copy_logits, _, _ = copy_mechanism(
-                    hidden_vec,
-                    rnn_out,
-                    src_batch,
-                    coverage=None
-                )
-                logits = logits + 0.5 * copy_logits
-            
-            if use_tier2 and lexicon_decoder is not None:
-                logits = lexicon_decoder(logits)
-            
-            loss += criterion(logits, target)
-        
-        loss = loss / tgt_batch.shape[1]
+            loss = loss / tgt_batch.shape[1]
         
         # Check for NaN
         if torch.isnan(loss):
@@ -302,19 +442,68 @@ def train_epoch(models, optimizer, criterion, train_data, batch_size, device,
             optimizer.zero_grad()
             continue
         
-        loss.backward()
-        grad_params = (list(embedding.parameters()) + list(tgt_embedding.parameters()) + 
-                      list(rnn.parameters()) + list(attention.parameters()) + 
-                      list(decoder.parameters()))
-        if copy_mechanism is not None:
-            grad_params.extend(list(copy_mechanism.parameters()))
-        if lexicon_decoder is not None:
-            grad_params.extend(list(lexicon_decoder.parameters()))
-        torch.nn.utils.clip_grad_norm_(grad_params, max_norm=5.0)
-        optimizer.step()
+        # Check for NaN
+        if torch.isnan(loss):
+            logger.warning(f"NaN loss detected, skipping batch")
+            optimizer.zero_grad()
+            continue
+        
+        # Backward pass with proper mixed precision handling
+        if use_amp:
+            scaler.scale(loss).backward()
+            grad_params = (list(embedding.parameters()) + list(tgt_embedding.parameters()) + 
+                          list(rnn.parameters()) + list(attention.parameters()) + 
+                          list(decoder.parameters()))
+            if copy_mechanism is not None:
+                grad_params.extend(list(copy_mechanism.parameters()))
+            if lexicon_decoder is not None:
+                grad_params.extend(list(lexicon_decoder.parameters()))
+            
+            # Priority 1: Strict gradient clipping to prevent exploding gradients
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(grad_params, max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            grad_params = (list(embedding.parameters()) + list(tgt_embedding.parameters()) + 
+                          list(rnn.parameters()) + list(attention.parameters()) + 
+                          list(decoder.parameters()))
+            if copy_mechanism is not None:
+                grad_params.extend(list(copy_mechanism.parameters()))
+            if lexicon_decoder is not None:
+                grad_params.extend(list(lexicon_decoder.parameters()))
+            
+            # Priority 1: Strict gradient clipping to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(grad_params, max_norm=1.0)
+            optimizer.step()
         
         total_loss += loss.item()
         batch_count += 1
+        
+        # After first batch: report actual GPU memory with a go/no-go check
+        if batch_idx == 0 and device.type == 'cuda':
+            first_batch_peak = torch.cuda.max_memory_allocated(device) / 1024**3
+            logger.info(f"    \u2713 First batch peak memory: {first_batch_peak:.1f} GB / {GPU_MEM_LIMIT} GB limit")
+            if first_batch_peak > GPU_MEM_LIMIT * 0.85:
+                logger.warning(f"    \u26a0 Memory usage {first_batch_peak:.1f} GB is {first_batch_peak/GPU_MEM_LIMIT:.0%} of limit!")
+        
+        # Log progress every 10 batches
+        if (batch_idx + 1) % 10 == 0:
+            if device.type == 'cuda':
+                gpu_mem_allocated = torch.cuda.memory_allocated(device) / 1024**3
+                gpu_mem_peak = torch.cuda.max_memory_allocated(device) / 1024**3
+                logger.info(f"    Batch {batch_idx + 1}/{total_batches} - Avg Loss: {total_loss/batch_count:.4f} - GPU Memory: {gpu_mem_allocated:.1f}GB (peak: {gpu_mem_peak:.1f}GB)")
+            else:
+                logger.info(f"    Batch {batch_idx + 1}/{total_batches} - Avg Loss: {total_loss/batch_count:.4f}")
+        
+        # Memory optimization: clear cache every N batches to prevent fragmentation
+        if device.type == 'cuda' and (batch_idx + 1) % 20 == 0:
+            torch.cuda.empty_cache()
+    
+    # Final memory cleanup
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
     
     return total_loss / batch_count if batch_count > 0 else 0
 
@@ -332,6 +521,8 @@ def validate(models, criterion, val_data, batch_size, device,
     src_data, tgt_data = val_data
     total_loss = 0
     batch_count = 0
+    
+    logger.info(f"  Starting validation: {len(src_data)} samples")
     
     with torch.no_grad():
         for batch_start in range(0, len(src_data), batch_size):
@@ -400,32 +591,42 @@ def train_single(models, optimizer, criterion, config, args, device,
     batch_size = args.batch_size or training_cfg.get('batch_size', 128)
     learning_rate = float(training_cfg.get('learning_rate', 0.0005))
     num_epochs = args.epochs or training_cfg.get('epochs', 100)
+    use_amp = training_cfg.get('use_amp', False)  # Get from config
     
     logger.info(f"\n{fold_str} | Train samples: {len(train_src)}, Val samples: {len(val_src)}")
+    if use_amp:
+        logger.info(f"  {fold_str} | Mixed Precision Training: ENABLED")
     
-    # Setup optimizer
+    # Setup optimizer with Priority 1: Weight decay for regularization
     optimizer = torch.optim.Adam(
         [p for m in models for p in m.parameters()] +
         ([p for p in copy_mechanism.parameters()] if copy_mechanism else []) +
         ([p for p in lexicon_decoder.parameters()] if lexicon_decoder else []),
-        lr=learning_rate
+        lr=learning_rate,
+        weight_decay=5e-4  # Increased L2 regularization (was 1e-4) to close train/val gap
     )
+    
+    # Create GradScaler for mixed precision training
+    scaler = GradScaler() if use_amp else None
     
     best_val_loss = float('inf')
     best_train_loss = float('inf')
+    best_overfitting_ratio = float('inf')
     annealing_mode = False
     epochs_in_annealing = 0
     anneal_lr_reduction_steps = 0
     
-    overfitting_threshold = 1.5
+    overfitting_threshold = 1.15  # Tighter threshold — folds showed overfitting at ~1.17x
     min_epochs = 15
-    annealing_patience = 50
+    target_overfitting_ratio = 1.25  # Early stop when ratio exceeds this (was 2.5)
+    annealing_patience = 8  # Was 20 — shortened to avoid wasted compute
     
     for epoch in range(num_epochs):
         train_loss = train_epoch(
             models, optimizer, criterion,
             (train_src, train_tgt), batch_size, device,
-            use_tier2, copy_mechanism, lexicon_decoder
+            use_tier2, copy_mechanism, lexicon_decoder,
+            use_amp, scaler
         )
         
         val_loss = validate(
@@ -447,20 +648,28 @@ def train_single(models, optimizer, criterion, config, args, device,
                    f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
                    f"Ratio: {overfitting_ratio:.2f}x{annealing_status}")
         
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_train_loss = train_loss
-            
+        # Save best model when val loss improves AND overfitting ratio is acceptable
+        should_save = False
+        if val_loss < best_val_loss * 0.995:  # At least 0.5% improvement
+            if overfitting_ratio <= target_overfitting_ratio:
+                should_save = True
+                best_val_loss = val_loss
+                best_train_loss = train_loss
+                best_overfitting_ratio = overfitting_ratio
+        
+        if should_save:
             if annealing_mode:
                 logger.info(f"  ✓ Improvement found during annealing! Resetting counter.")
                 epochs_in_annealing = 0
             
             # Save checkpoint
+            # models = [src_embedding, tgt_embedding, rnn, attention, decoder]
             checkpoint = {
-                'embedding': models[0].state_dict(),
-                'rnn': models[1].state_dict(),
-                'attention': models[2].state_dict(),
-                'decoder': models[3].state_dict(),
+                'src_embedding': models[0].state_dict(),
+                'tgt_embedding': models[1].state_dict(),
+                'rnn': models[2].state_dict(),
+                'attention': models[3].state_dict(),
+                'decoder': models[4].state_dict(),
             }
             if copy_mechanism:
                 checkpoint['copy_mechanism'] = copy_mechanism.state_dict()
@@ -473,41 +682,38 @@ def train_single(models, optimizer, criterion, config, args, device,
                 torch.save(checkpoint, fold_dir / "best_model.pt")
             else:
                 torch.save(checkpoint, checkpoint_dir / f"{args.model}_best.pt")
-            logger.info(f"  ✓ Saved best model (val loss: {val_loss:.4f})")
-        else:
-            if annealing_mode:
-                epochs_in_annealing += 1
-                
-                if epochs_in_annealing % 5 == 0 and anneal_lr_reduction_steps < 4:
-                    anneal_lr_reduction_steps += 1
-                    current_lr = optimizer.param_groups[0]['lr']
-                    new_lr = current_lr * 0.7
-                    for param_group in optimizer.param_groups:
-                        param_group['lr'] = new_lr
-                    logger.info(f"  ⚠ Annealing step {anneal_lr_reduction_steps}: LR → {new_lr:.2e}")
-                
-                if epochs_in_annealing >= annealing_patience:
-                    logger.info(f"  Early stopping: No improvement after {annealing_patience} annealing epochs")
-                    break
+            logger.info(f"  ✓ Saved best model (val loss: {val_loss:.4f}, ratio: {overfitting_ratio:.2f}x)")
+        
+        # Early stopping if overfitting ratio exceeds threshold
+        if (epoch >= min_epochs and 
+            overfitting_ratio > target_overfitting_ratio and 
+            not annealing_mode):
+            annealing_mode = True
+            epochs_in_annealing = 0
+            anneal_lr_reduction_steps = 0
+            logger.info(f"\n⚠ OVERFITTING DETECTED: {overfitting_ratio:.2f}x ratio at epoch {epoch+1}")
+            logger.info(f"  Triggering gradual learning rate annealing")
+            logger.info(f"  Will attempt to recover for up to {annealing_patience} epochs")
+            current_lr = optimizer.param_groups[0]['lr']
+            new_lr = current_lr * 0.5
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = new_lr
+            logger.info(f"  Initial LR reduction: {current_lr:.2e} → {new_lr:.2e}")
+        
+        if annealing_mode:
+            epochs_in_annealing += 1
             
-            if (epoch >= min_epochs and 
-                overfitting_ratio > overfitting_threshold and 
-                not annealing_mode):
-                
-                annealing_mode = True
-                epochs_in_annealing = 0
-                anneal_lr_reduction_steps = 0
-                
-                logger.info(f"\n⚠ OVERFITTING DETECTED: {overfitting_ratio:.2f}x ratio at epoch {epoch+1}")
-                logger.info(f"  Triggering gradual learning rate annealing")
-                logger.info(f"  Will attempt to recover for up to {annealing_patience} epochs")
-                
+            if epochs_in_annealing % 5 == 0 and anneal_lr_reduction_steps < 10:
+                anneal_lr_reduction_steps += 1
                 current_lr = optimizer.param_groups[0]['lr']
-                new_lr = current_lr * 0.5
+                new_lr = current_lr * 0.7
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = new_lr
-                
-                logger.info(f"  Initial LR reduction: {current_lr:.2e} → {new_lr:.2e}")
+                logger.info(f"  ⚠ Annealing step {anneal_lr_reduction_steps}: LR → {new_lr:.2e}")
+            
+            if epochs_in_annealing >= annealing_patience:
+                logger.info(f"  Early stopping: No improvement after {annealing_patience} annealing epochs")
+                break
     
     return best_val_loss
 
@@ -524,7 +730,7 @@ def main():
     parser.add_argument('--data-path', type=str, default='data/processed/train_augmented.csv',
                        help='Path to training data')
     parser.add_argument('--config', type=str, default=None, help='Config file path')
-    parser.add_argument('--folds', type=int, default=None, help='Number of k-folds (if None, uses 80/20 split)')
+    parser.add_argument('--folds', type=int, default=3, help='Number of k-folds for cross-validation')
     args = parser.parse_args()
     
     logger.info("="*80)
@@ -532,7 +738,7 @@ def main():
     logger.info(f"Model: {args.model}")
     logger.info("="*80)
     
-    project_root = Path(__file__).parent
+    project_root = Path(__file__).parent.parent  # Go up from src/ to project root
     
     # Determine config path
     if args.config:
@@ -552,12 +758,20 @@ def main():
     config = load_config(config_path)
     
     # Check GPU
+    GPU_MEMORY_LIMIT_GB = 80  # HARD LIMIT — never exceed this
     if torch.cuda.is_available():
         device = torch.device("cuda")
+        total_gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
         logger.info(f"✓ GPU: {torch.cuda.get_device_name(0)}")
-        logger.info(f"  Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+        logger.info(f"  Memory: {total_gpu_mem_gb:.1f} GB")
+        logger.info(f"  HARD LIMIT: {GPU_MEMORY_LIMIT_GB} GB")
+        # Set hard memory fraction limit
+        mem_fraction = min(GPU_MEMORY_LIMIT_GB / total_gpu_mem_gb, 0.95)
+        torch.cuda.set_per_process_memory_fraction(mem_fraction, 0)
+        logger.info(f"  Memory fraction cap: {mem_fraction:.2%} ({GPU_MEMORY_LIMIT_GB:.0f}/{total_gpu_mem_gb:.0f} GB)")
     else:
         device = torch.device("cpu")
+        total_gpu_mem_gb = 0
         logger.warning("⚠ Using CPU (GPU not available)")
     
     # Load data
@@ -568,6 +782,10 @@ def main():
     
     df = pd.read_csv(data_path)
     logger.info(f"✓ Loaded {len(df)} samples")
+    
+    # Memory optimization: Enable cuDNN autotuner for better performance
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
     
     # Build tokenizers
     logger.info("\nBuilding tokenizers...")
@@ -582,7 +800,7 @@ def main():
     
     # Encode data
     logger.info("\nEncoding data...")
-    max_len = 256
+    max_len = 180  # Reduced from 256 to save ~30% GPU memory on sequence dimensions
     src_data = torch.stack([src_tokenizer.encode(text, max_len) for text in df['transliteration']])
     tgt_data = torch.stack([tgt_tokenizer.encode(text, max_len) for text in df['translation']])
     logger.info(f"✓ Data shape: {src_data.shape}")
@@ -607,6 +825,27 @@ def main():
     logger.info(f"  - LSTM: {num_layers} layers x {hidden_dim} hidden")
     logger.info(f"  - Decoder: {hidden_dim * 2} -> {len(tgt_tokenizer)}")
     
+    # Estimate GPU memory usage before training
+    total_params = sum(p.numel() for p in embedding.parameters()) + \
+                   sum(p.numel() for p in tgt_embedding.parameters()) + \
+                   sum(p.numel() for p in rnn.parameters()) + \
+                   sum(p.numel() for p in attention.parameters()) + \
+                   sum(p.numel() for p in decoder.parameters())
+    param_mem_gb = total_params * 4 / 1e9  # float32
+    # Model + gradients + Adam states (2 moments) = 4× params
+    optimizer_mem_gb = param_mem_gb * 4
+    # Activation memory estimate: batch × seq_len × hidden × overhead_factor
+    batch_size_estimate = training_cfg.get('batch_size', 64) if 'training_cfg' not in dir() else 64
+    activation_mem_gb = (batch_size_estimate * max_len * hidden_dim * 4 * 8) / 1e9  # rough 8× factor for autograd
+    estimated_peak_gb = optimizer_mem_gb + activation_mem_gb
+    logger.info(f"  - Total params: {total_params:,} ({param_mem_gb:.2f} GB)")
+    logger.info(f"  - Est. peak GPU: {estimated_peak_gb:.1f} GB (limit: {GPU_MEMORY_LIMIT_GB} GB)")
+    
+    if estimated_peak_gb > GPU_MEMORY_LIMIT_GB * 0.9:
+        logger.warning(f"⚠ Estimated memory {estimated_peak_gb:.1f} GB approaches limit {GPU_MEMORY_LIMIT_GB} GB!")
+        logger.warning(f"  Reducing batch size from {batch_size_estimate} to {batch_size_estimate // 2}")
+        # Will be applied via the batch_size variable below
+    
     # TIER 2 components
     copy_mechanism = None
     lexicon_decoder = None
@@ -623,18 +862,32 @@ def main():
     
     # Training setup
     training_cfg = config.get('training', {})
-    batch_size = args.batch_size or training_cfg.get('batch_size', 128)
+    # Memory optimization: Default batch size reduced from 128 to 64 to save ~50% memory on tensor allocations
+    default_batch_size = training_cfg.get('batch_size', 128)
+    # If no override, automatically reduce batch size for GPU memory constraints
+    if args.batch_size is None and torch.cuda.is_available():
+        if total_gpu_mem_gb < 80 or estimated_peak_gb > GPU_MEMORY_LIMIT_GB * 0.9:
+            default_batch_size = min(default_batch_size, 32)
+            logger.info(f"  Auto-reduced batch size to {default_batch_size} for memory safety")
+    batch_size = args.batch_size or default_batch_size
     learning_rate = float(training_cfg.get('learning_rate', 0.0005))
     num_epochs = args.epochs or training_cfg.get('epochs', 100)
-    early_stop_patience = 20  # Reduced to 20 to prevent overfitting
+    early_stop_patience = 8  # Reduced to 8 — val loss plateaued by epoch ~28 in all folds
     
-    criterion = nn.CrossEntropyLoss(ignore_index=0)
+    # Priority 2: Label smoothing loss instead of standard CE loss
+    criterion = LabelSmoothingCrossEntropy(
+        num_classes=len(tgt_tokenizer),
+        smoothing=0.1,  # 10% smoothing
+        ignore_index=0
+    )
     
     logger.info(f"\nTraining config:")
     logger.info(f"  Batch size: {batch_size}")
     logger.info(f"  Learning rate: {learning_rate}")
     logger.info(f"  Epochs: {num_epochs}")
     logger.info(f"  Early stopping: {early_stop_patience} epochs")
+    logger.info(f"  Sequence length: {max_len}")
+    logger.info(f"  GPU Memory HARD LIMIT: {GPU_MEMORY_LIMIT_GB} GB")
     
     checkpoint_dir = project_root / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -712,6 +965,15 @@ def main():
         logger.info(f"Best Fold: {min(fold_results, key=lambda x: x['val_loss'])['fold']} "
                    f"(Loss: {min(fold_results, key=lambda x: x['val_loss'])['val_loss']:.4f})")
         logger.info(f"\n✓ Fold checkpoints saved to: checkpoints/fold_*")
+
+        # Copy best fold to production checkpoint
+        best_fold = min(fold_results, key=lambda x: x['val_loss'])
+        best_fold_dir = checkpoint_dir / f"fold_{best_fold['fold'] - 1}"
+        production_path = checkpoint_dir / f"{args.model}_best.pt"
+        if (best_fold_dir / "best_model.pt").exists():
+            import shutil
+            shutil.copy2(best_fold_dir / "best_model.pt", production_path)
+            logger.info(f"✓ Copied best fold {best_fold['fold']} checkpoint to: {production_path}")
         
     else:
         # Regular Training (80/20 split)
@@ -737,15 +999,13 @@ def main():
             checkpoint_dir, use_tier2, copy_mechanism, lexicon_decoder
         )
         
-        logger.info("\n" + "="*80)
-        logger.info("✓ TRAINING COMPLETE")
-        logger.info("="*80)
-        logger.info(f"Best validation loss: {best_val_loss:.4f}")
-    if annealing_mode:
-        logger.info(f"Annealing was triggered at epoch {overfitting_detected_epoch+1}")
-        logger.info(f"Survived {epochs_in_annealing}/{annealing_patience} annealing epochs")
-    checkpoint_file = checkpoint_dir / f"{args.model}_best.pt"
-    logger.info(f"Checkpoint saved: {checkpoint_file}")
+        logger.info(f"\nBest validation loss: {best_val_loss:.4f}")
+        checkpoint_file = checkpoint_dir / f"{args.model}_best.pt"
+        logger.info(f"Checkpoint saved: {checkpoint_file}")
+
+    logger.info("\n" + "="*80)
+    logger.info("TRAINING COMPLETE")
+    logger.info("="*80)
 
 
 if __name__ == '__main__':

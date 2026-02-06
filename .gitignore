@@ -44,6 +44,7 @@ wheels/
 
 # Model checkpoints and weights
 /checkpoints/*.pt
+/checkpoints/**/*.pt
 /models/*.pt
 /models/mbart_checkpoints/
 /models/mbart50/
@@ -56,6 +57,7 @@ wheels/
 # Results and outputs
 /results/
 predictions.csv
+predictions_beam.csv
 submission.csv
 
 # Temporary files
