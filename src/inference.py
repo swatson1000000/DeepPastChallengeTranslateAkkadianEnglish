@@ -227,7 +227,8 @@ class Seq2SeqInference:
         
         # Load models
         self.embedding = None
-        self.rnn = None
+        self.rnn = None  # encoder RNN (also aliased as self.encoder_rnn)
+        self.decoder_rnn = None  # separate decoder RNN (if present in checkpoint)
         self.attention = None
         self.decoder = None
         self.copy_mechanism = None
@@ -282,10 +283,26 @@ class Seq2SeqInference:
         self.hidden_size = hidden_size  # Store for copy mechanism
         
         self.rnn = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True,
-                          dropout=0.4 if num_layers > 1 else 0)
+                          dropout=0.3 if num_layers > 1 else 0)
         self.rnn.load_state_dict(lstm_state)
         self.rnn = self.rnn.to(self.device).eval()
+        self.encoder_rnn = self.rnn  # alias
         logger.info(f"✓ LSTM encoder ({num_layers} layers, {hidden_size} hidden) loaded")
+        
+        # Separate Decoder RNN (if present in checkpoint)
+        if 'decoder_rnn' in checkpoint:
+            dec_lstm_state = checkpoint['decoder_rnn']
+            dec_num_layers = max([int(k.split('_l')[-1]) for k in dec_lstm_state.keys() if '_l' in k]) + 1
+            dec_hidden_size = dec_lstm_state['weight_hh_l0'].shape[0] // 4
+            dec_input_size = dec_lstm_state['weight_ih_l0'].shape[1]
+            self.decoder_rnn = nn.LSTM(dec_input_size, dec_hidden_size, dec_num_layers, batch_first=True,
+                                       dropout=0.3 if dec_num_layers > 1 else 0)
+            self.decoder_rnn.load_state_dict(dec_lstm_state)
+            self.decoder_rnn = self.decoder_rnn.to(self.device).eval()
+            logger.info(f"✓ Separate LSTM decoder ({dec_num_layers} layers, {dec_hidden_size} hidden) loaded")
+        else:
+            self.decoder_rnn = self.rnn  # fallback: shared encoder/decoder
+            logger.info("  (Using shared encoder/decoder RNN — older checkpoint)")
         
         # Attention Mechanism
         self.attention = AttentionLayer(hidden_size)
@@ -387,13 +404,13 @@ class Seq2SeqInference:
                 
                 current_embedded = self.tgt_embedding(torch.tensor([current_token], device=self.device))
                 
-                if isinstance(self.rnn, nn.LSTM):
-                    _, (hidden_state, cell_state) = self.rnn(
+                if isinstance(self.decoder_rnn, nn.LSTM):
+                    _, (hidden_state, cell_state) = self.decoder_rnn(
                         current_embedded.unsqueeze(1), (hidden_state, cell_state)
                     )
                     hidden_vec = hidden_state[-1, :, :]  # Get last layer, all batch
                 else:
-                    _, hidden_state = self.rnn(current_embedded.unsqueeze(1), hidden_state)
+                    _, hidden_state = self.decoder_rnn(current_embedded.unsqueeze(1), hidden_state)
                     hidden_vec = hidden_state[-1, :, :]
                 
                 # Use first batch element if needed
@@ -477,13 +494,13 @@ class Seq2SeqInference:
                     current_token = max(0, min(current_token, self.tgt_vocab_size - 1))
                     current_embedded = self.tgt_embedding(torch.tensor([current_token], device=self.device))
                     
-                    # RNN forward step
-                    if isinstance(self.rnn, nn.LSTM):
-                        _, (new_hidden, new_cell) = self.rnn(
+                    # RNN forward step (use decoder RNN)
+                    if isinstance(self.decoder_rnn, nn.LSTM):
+                        _, (new_hidden, new_cell) = self.decoder_rnn(
                             current_embedded.unsqueeze(1), (hid, cell)
                         )
                     else:
-                        _, new_hidden = self.rnn(current_embedded.unsqueeze(1), hid)
+                        _, new_hidden = self.decoder_rnn(current_embedded.unsqueeze(1), hid)
                         new_cell = cell
                     
                     hidden_vec = new_hidden[-1, 0] if new_hidden.dim() == 3 else new_hidden[-1]
@@ -592,10 +609,10 @@ class Seq2SeqInference:
             # Encode sequence
             with torch.no_grad():
                 embedded = self.embedding(src_tensor)
-                if isinstance(self.rnn, nn.LSTM):
-                    encoder_outputs, (hidden, cell) = self.rnn(embedded)
+                if isinstance(self.encoder_rnn, nn.LSTM):
+                    encoder_outputs, (hidden, cell) = self.encoder_rnn(embedded)
                 else:
-                    encoder_outputs, hidden = self.rnn(embedded)
+                    encoder_outputs, hidden = self.encoder_rnn(embedded)
                     cell = None
             
             # Decode with selected strategy
@@ -609,7 +626,7 @@ class Seq2SeqInference:
                     coverage_penalty=0.0
                 )
             else:
-                if isinstance(self.rnn, nn.LSTM):
+                if isinstance(self.encoder_rnn, nn.LSTM):
                     decoded, _ = self.greedy_decode(encoder_outputs, hidden, cell, src_tokens=src_tensor, use_copy=use_copy)
                 else:
                     decoded, _ = self.greedy_decode(encoder_outputs, hidden, None, src_tokens=src_tensor, use_copy=use_copy)

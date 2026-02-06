@@ -139,20 +139,23 @@ def main():
     embedding_dim = encoder_cfg.get('embedding_dim', encoder_cfg.get('embedding_size', 512))
     hidden_dim = encoder_cfg.get('hidden_size', 1024)
     num_layers = encoder_cfg.get('num_layers', 4)
-    dropout_rate = encoder_cfg.get('dropout', 0.4)
+    dropout_rate = encoder_cfg.get('dropout', 0.3)
     
     embedding = nn.Embedding(len(src_tokenizer), embedding_dim).to(device)
     tgt_embedding = nn.Embedding(len(tgt_tokenizer), embedding_dim).to(device)
-    rnn = nn.LSTM(embedding_dim, hidden_dim, num_layers, batch_first=True,
+    encoder_rnn = nn.LSTM(embedding_dim, hidden_dim, num_layers, batch_first=True,
+                  dropout=dropout_rate if num_layers > 1 else 0).to(device)
+    decoder_rnn = nn.LSTM(embedding_dim, hidden_dim, num_layers, batch_first=True,
                   dropout=dropout_rate if num_layers > 1 else 0).to(device)
     attention = AttentionLayer(hidden_dim).to(device)
     decoder = nn.Linear(hidden_dim * 2, len(tgt_tokenizer)).to(device)
     
-    total_params = sum(p.numel() for model in [embedding, tgt_embedding, rnn, attention, decoder] for p in model.parameters())
+    total_params = sum(p.numel() for model in [embedding, tgt_embedding, encoder_rnn, decoder_rnn, attention, decoder] for p in model.parameters())
     logger.info(f"✓ Model created with {total_params:,} parameters")
     logger.info(f"  - Embedding: {embedding_dim} dim")
-    logger.info(f"  - LSTM: {num_layers} layers x {hidden_dim} hidden")
-    logger.info(f"  - Decoder: {hidden_dim * 2} -> {len(tgt_tokenizer)}")
+    logger.info(f"  - Encoder LSTM: {num_layers} layers x {hidden_dim} hidden")
+    logger.info(f"  - Decoder LSTM: {num_layers} layers x {hidden_dim} hidden")
+    logger.info(f"  - Decoder linear: {hidden_dim * 2} -> {len(tgt_tokenizer)}")
     
     # Load checkpoint if available
     checkpoint_path = project_root / "checkpoints/tier3_best.pt"
@@ -162,7 +165,14 @@ def main():
         checkpoint = torch.load(checkpoint_path, map_location=device)
         embedding.load_state_dict(checkpoint['src_embedding'])
         tgt_embedding.load_state_dict(checkpoint['tgt_embedding'])
-        rnn.load_state_dict(checkpoint['rnn'])
+        encoder_rnn.load_state_dict(checkpoint['rnn'])
+        if 'decoder_rnn' in checkpoint:
+            decoder_rnn.load_state_dict(checkpoint['decoder_rnn'])
+            logger.info(f"✓ Loaded separate decoder RNN from checkpoint")
+        else:
+            # Older checkpoint with shared RNN — copy encoder weights to decoder
+            decoder_rnn.load_state_dict(checkpoint['rnn'])
+            logger.info(f"  (Using shared encoder/decoder RNN — older checkpoint)")
         attention.load_state_dict(checkpoint['attention'])
         decoder.load_state_dict(checkpoint['decoder'])
         logger.info(f"✓ Loaded checkpoint from {checkpoint_path}")
@@ -172,7 +182,8 @@ def main():
     # Set to eval mode
     embedding.eval()
     tgt_embedding.eval()
-    rnn.eval()
+    encoder_rnn.eval()
+    decoder_rnn.eval()
     attention.eval()
     decoder.eval()
     
@@ -198,14 +209,14 @@ def main():
             
             # Forward pass with attention
             embedded = embedding(src_encoded)
-            rnn_out, (hidden, cell) = rnn(embedded)
+            rnn_out, (hidden, cell) = encoder_rnn(embedded)
             
-            # Decode step by step
+            # Decode step by step with decoder RNN
             predicted_tokens = []
             input_token = torch.tensor([2], device=device)  # SOS
             for step in range(max_len):
                 prev_embedded = tgt_embedding(input_token)
-                _, (hidden, cell) = rnn(prev_embedded.unsqueeze(1), (hidden, cell))
+                _, (hidden, cell) = decoder_rnn(prev_embedded.unsqueeze(1), (hidden, cell))
                 hidden_vec = hidden[-1]
                 context, _ = attention(hidden_vec, rnn_out.squeeze(0))
                 decoder_input = torch.cat([hidden_vec, context], dim=-1)

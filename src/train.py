@@ -302,12 +302,13 @@ def calculate_bleu(predictions, references, max_n=2):
 def train_epoch(models, optimizer, criterion, train_data, batch_size, device, 
                 use_tier2=False, copy_mechanism=None, lexicon_decoder=None,
                 use_amp=False, scaler=None,
-                embedding_dropout_rate=0.4, decoder_dropout_rate=0.3):
+                embedding_dropout_rate=0.1, decoder_dropout_rate=0.1):
     """Train for one epoch."""
-    embedding, tgt_embedding, rnn, attention, decoder = models
+    embedding, tgt_embedding, encoder_rnn, decoder_rnn, attention, decoder = models
     embedding.train()
     tgt_embedding.train()
-    rnn.train()
+    encoder_rnn.train()
+    decoder_rnn.train()
     attention.train()
     decoder.train()
     
@@ -355,66 +356,69 @@ def train_epoch(models, optimizer, criterion, train_data, batch_size, device,
         # Mixed Precision: wrap forward pass in autocast if enabled
         if use_amp:
             with autocast():
-                # Encode
+                # Encode with encoder RNN
                 embedded = emb_dropout(embedding(src_batch))
-                if isinstance(rnn, nn.LSTM):
-                    rnn_out, (hidden, cell) = rnn(embedded)
-                else:
-                    rnn_out, hidden = rnn(embedded)
+                encoder_out, (enc_hidden, enc_cell) = encoder_rnn(embedded)
                 
-                # Decode
+                dec_hidden, dec_cell = enc_hidden, enc_cell
+                
+                # Decode with decoder RNN
                 loss = 0
+                num_content_steps = 0
                 for step in range(1, tgt_batch.shape[1]):
                     prev_token = tgt_batch[:, step-1]
                     target = tgt_batch[:, step]
                     
+                    non_pad = (target != 0).sum().item()
+                    if non_pad == 0:
+                        break
+                    
                     prev_embedded = emb_dropout(tgt_embedding(prev_token))
                     
-                    if isinstance(rnn, nn.LSTM):
-                        _, (hidden, cell) = rnn(prev_embedded.unsqueeze(1), (hidden, cell))
-                        hidden_vec = hidden[-1]
-                    else:
-                        _, hidden = rnn(prev_embedded.unsqueeze(1), hidden)
-                        hidden_vec = hidden[-1]
+                    _, (dec_hidden, dec_cell) = decoder_rnn(prev_embedded.unsqueeze(1), (dec_hidden, dec_cell))
+                    hidden_vec = dec_hidden[-1]
                     
-                    context, _ = attention(hidden_vec, rnn_out)
+                    context, _ = attention(hidden_vec, encoder_out)
                     decoder_input = torch.cat([hidden_vec, context], dim=-1)
                     logits = decoder(dec_dropout(decoder_input))
                     
                     if use_tier2 and copy_mechanism is not None:
-                        copy_logits, _, _ = copy_mechanism(hidden_vec, rnn_out, src_batch, coverage=None)
+                        copy_logits, _, _ = copy_mechanism(hidden_vec, encoder_out, src_batch, coverage=None)
                         logits = logits + 0.5 * copy_logits
                     
                     if use_tier2 and lexicon_decoder is not None:
                         logits = lexicon_decoder(logits)
                     
                     loss += criterion(logits, target)
+                    num_content_steps += 1
                 
-                loss = loss / tgt_batch.shape[1]
+                loss = loss / max(num_content_steps, 1)
         else:
-            # Encode
+            # Encode with encoder RNN
             embedded = emb_dropout(embedding(src_batch))
-            if isinstance(rnn, nn.LSTM):
-                rnn_out, (hidden, cell) = rnn(embedded)
-            else:
-                rnn_out, hidden = rnn(embedded)
+            encoder_out, (enc_hidden, enc_cell) = encoder_rnn(embedded)
             
-            # Decode
+            # Initialize decoder hidden state from encoder
+            dec_hidden, dec_cell = enc_hidden, enc_cell
+            
+            # Decode with separate decoder RNN
             loss = 0
+            num_content_steps = 0
             for step in range(1, tgt_batch.shape[1]):
                 prev_token = tgt_batch[:, step-1]
                 target = tgt_batch[:, step]
                 
-                prev_embedded = emb_dropout(tgt_embedding(prev_token))  # Use TARGET embedding, not source!
+                # Skip if entire batch is PAD at this step
+                non_pad = (target != 0).sum().item()
+                if non_pad == 0:
+                    break
                 
-                if isinstance(rnn, nn.LSTM):
-                    _, (hidden, cell) = rnn(prev_embedded.unsqueeze(1), (hidden, cell))
-                    hidden_vec = hidden[-1]  # Get last layer: (batch, hidden_dim)
-                else:
-                    _, hidden = rnn(prev_embedded.unsqueeze(1), hidden)
-                    hidden_vec = hidden[-1]  # Get last layer: (batch, hidden_dim)
+                prev_embedded = emb_dropout(tgt_embedding(prev_token))
                 
-                context, _ = attention(hidden_vec, rnn_out)
+                _, (dec_hidden, dec_cell) = decoder_rnn(prev_embedded.unsqueeze(1), (dec_hidden, dec_cell))
+                hidden_vec = dec_hidden[-1]  # Get last layer: (batch, hidden_dim)
+                
+                context, _ = attention(hidden_vec, encoder_out)
                 decoder_input = torch.cat([hidden_vec, context], dim=-1)
                 
                 logits = decoder(dec_dropout(decoder_input))
@@ -423,7 +427,7 @@ def train_epoch(models, optimizer, criterion, train_data, batch_size, device,
                 if use_tier2 and copy_mechanism is not None:
                     copy_logits, _, _ = copy_mechanism(
                         hidden_vec,
-                        rnn_out,
+                        encoder_out,
                         src_batch,
                         coverage=None
                     )
@@ -433,8 +437,9 @@ def train_epoch(models, optimizer, criterion, train_data, batch_size, device,
                     logits = lexicon_decoder(logits)
                 
                 loss += criterion(logits, target)
+                num_content_steps += 1
             
-            loss = loss / tgt_batch.shape[1]
+            loss = loss / max(num_content_steps, 1)
         
         # Check for NaN
         if torch.isnan(loss):
@@ -452,8 +457,8 @@ def train_epoch(models, optimizer, criterion, train_data, batch_size, device,
         if use_amp:
             scaler.scale(loss).backward()
             grad_params = (list(embedding.parameters()) + list(tgt_embedding.parameters()) + 
-                          list(rnn.parameters()) + list(attention.parameters()) + 
-                          list(decoder.parameters()))
+                          list(encoder_rnn.parameters()) + list(decoder_rnn.parameters()) + 
+                          list(attention.parameters()) + list(decoder.parameters()))
             if copy_mechanism is not None:
                 grad_params.extend(list(copy_mechanism.parameters()))
             if lexicon_decoder is not None:
@@ -467,8 +472,8 @@ def train_epoch(models, optimizer, criterion, train_data, batch_size, device,
         else:
             loss.backward()
             grad_params = (list(embedding.parameters()) + list(tgt_embedding.parameters()) + 
-                          list(rnn.parameters()) + list(attention.parameters()) + 
-                          list(decoder.parameters()))
+                          list(encoder_rnn.parameters()) + list(decoder_rnn.parameters()) + 
+                          list(attention.parameters()) + list(decoder.parameters()))
             if copy_mechanism is not None:
                 grad_params.extend(list(copy_mechanism.parameters()))
             if lexicon_decoder is not None:
@@ -511,10 +516,11 @@ def train_epoch(models, optimizer, criterion, train_data, batch_size, device,
 def validate(models, criterion, val_data, batch_size, device,
              use_tier2=False, copy_mechanism=None, lexicon_decoder=None):
     """Validate model."""
-    embedding, tgt_embedding, rnn, attention, decoder = models
+    embedding, tgt_embedding, encoder_rnn, decoder_rnn, attention, decoder = models
     embedding.eval()
     tgt_embedding.eval()
-    rnn.eval()
+    encoder_rnn.eval()
+    decoder_rnn.eval()
     attention.eval()
     decoder.eval()
     
@@ -531,26 +537,26 @@ def validate(models, criterion, val_data, batch_size, device,
             tgt_batch = tgt_data[batch_start:batch_end].to(device)
             
             embedded = embedding(src_batch)
-            if isinstance(rnn, nn.LSTM):
-                rnn_out, (hidden, cell) = rnn(embedded)
-            else:
-                rnn_out, hidden = rnn(embedded)
+            encoder_out, (enc_hidden, enc_cell) = encoder_rnn(embedded)
+            
+            dec_hidden, dec_cell = enc_hidden, enc_cell
             
             loss = 0
+            num_content_steps = 0
             for step in range(1, tgt_batch.shape[1]):
                 prev_token = tgt_batch[:, step-1]
                 target = tgt_batch[:, step]
                 
-                prev_embedded = tgt_embedding(prev_token)  # Use TARGET embedding!
+                non_pad = (target != 0).sum().item()
+                if non_pad == 0:
+                    break
                 
-                if isinstance(rnn, nn.LSTM):
-                    _, (hidden, cell) = rnn(prev_embedded.unsqueeze(1), (hidden, cell))
-                    hidden_vec = hidden[-1]
-                else:
-                    _, hidden = rnn(prev_embedded.unsqueeze(1), hidden)
-                    hidden_vec = hidden[-1]
+                prev_embedded = tgt_embedding(prev_token)
                 
-                context, _ = attention(hidden_vec, rnn_out)
+                _, (dec_hidden, dec_cell) = decoder_rnn(prev_embedded.unsqueeze(1), (dec_hidden, dec_cell))
+                hidden_vec = dec_hidden[-1]
+                
+                context, _ = attention(hidden_vec, encoder_out)
                 decoder_input = torch.cat([hidden_vec, context], dim=-1)
                 
                 logits = decoder(decoder_input)
@@ -558,7 +564,7 @@ def validate(models, criterion, val_data, batch_size, device,
                 if use_tier2 and copy_mechanism is not None:
                     copy_logits, _, _ = copy_mechanism(
                         hidden_vec,
-                        rnn_out,
+                        encoder_out,
                         src_batch,
                         coverage=None
                     )
@@ -568,8 +574,9 @@ def validate(models, criterion, val_data, batch_size, device,
                     logits = lexicon_decoder(logits)
                 
                 loss += criterion(logits, target)
+                num_content_steps += 1
             
-            loss = loss / tgt_batch.shape[1]
+            loss = loss / max(num_content_steps, 1)
             
             # Check for NaN and skip batch if detected
             if not torch.isnan(loss):
@@ -603,7 +610,7 @@ def train_single(models, optimizer, criterion, config, args, device,
         ([p for p in copy_mechanism.parameters()] if copy_mechanism else []) +
         ([p for p in lexicon_decoder.parameters()] if lexicon_decoder else []),
         lr=learning_rate,
-        weight_decay=5e-4  # Increased L2 regularization (was 1e-4) to close train/val gap
+        weight_decay=1e-4  # L2 regularization
     )
     
     # Create GradScaler for mixed precision training
@@ -650,7 +657,7 @@ def train_single(models, optimizer, criterion, config, args, device,
         
         # Save best model when val loss improves AND overfitting ratio is acceptable
         should_save = False
-        if val_loss < best_val_loss * 0.995:  # At least 0.5% improvement
+        if val_loss < best_val_loss:  # Any improvement counts
             if overfitting_ratio <= target_overfitting_ratio:
                 should_save = True
                 best_val_loss = val_loss
@@ -663,13 +670,14 @@ def train_single(models, optimizer, criterion, config, args, device,
                 epochs_in_annealing = 0
             
             # Save checkpoint
-            # models = [src_embedding, tgt_embedding, rnn, attention, decoder]
+            # models = [src_embedding, tgt_embedding, encoder_rnn, decoder_rnn, attention, decoder]
             checkpoint = {
                 'src_embedding': models[0].state_dict(),
                 'tgt_embedding': models[1].state_dict(),
                 'rnn': models[2].state_dict(),
-                'attention': models[3].state_dict(),
-                'decoder': models[4].state_dict(),
+                'decoder_rnn': models[3].state_dict(),
+                'attention': models[4].state_dict(),
+                'decoder': models[5].state_dict(),
             }
             if copy_mechanism:
                 checkpoint['copy_mechanism'] = copy_mechanism.state_dict()
@@ -814,28 +822,32 @@ def main():
     dropout_rate = encoder_cfg.get('dropout', 0.3)
     
     embedding = nn.Embedding(len(src_tokenizer), embedding_dim).to(device)
-    tgt_embedding = nn.Embedding(len(tgt_tokenizer), embedding_dim).to(device)  # Target embedding for decoding
-    rnn = nn.LSTM(embedding_dim, hidden_dim, num_layers, batch_first=True,
-                  dropout=dropout_rate if num_layers > 1 else 0).to(device)
+    tgt_embedding = nn.Embedding(len(tgt_tokenizer), embedding_dim).to(device)
+    encoder_rnn = nn.LSTM(embedding_dim, hidden_dim, num_layers, batch_first=True,
+                          dropout=dropout_rate if num_layers > 1 else 0).to(device)
+    decoder_rnn = nn.LSTM(embedding_dim, hidden_dim, num_layers, batch_first=True,
+                          dropout=dropout_rate if num_layers > 1 else 0).to(device)
     attention = AttentionLayer(hidden_dim).to(device)
-    decoder = nn.Linear(hidden_dim * 2, len(tgt_tokenizer)).to(device)
+    decoder_linear = nn.Linear(hidden_dim * 2, len(tgt_tokenizer)).to(device)
     
     logger.info(f"✓ Model created")
     logger.info(f"  - Embedding: {embedding_dim} dim")
-    logger.info(f"  - LSTM: {num_layers} layers x {hidden_dim} hidden")
-    logger.info(f"  - Decoder: {hidden_dim * 2} -> {len(tgt_tokenizer)}")
+    logger.info(f"  - Encoder LSTM: {num_layers} layers x {hidden_dim} hidden")
+    logger.info(f"  - Decoder LSTM: {num_layers} layers x {hidden_dim} hidden")
+    logger.info(f"  - Output: {hidden_dim * 2} -> {len(tgt_tokenizer)}")
     
     # Estimate GPU memory usage before training
     total_params = sum(p.numel() for p in embedding.parameters()) + \
                    sum(p.numel() for p in tgt_embedding.parameters()) + \
-                   sum(p.numel() for p in rnn.parameters()) + \
+                   sum(p.numel() for p in encoder_rnn.parameters()) + \
+                   sum(p.numel() for p in decoder_rnn.parameters()) + \
                    sum(p.numel() for p in attention.parameters()) + \
-                   sum(p.numel() for p in decoder.parameters())
+                   sum(p.numel() for p in decoder_linear.parameters())
     param_mem_gb = total_params * 4 / 1e9  # float32
     # Model + gradients + Adam states (2 moments) = 4× params
     optimizer_mem_gb = param_mem_gb * 4
     # Activation memory estimate: batch × seq_len × hidden × overhead_factor
-    batch_size_estimate = training_cfg.get('batch_size', 64) if 'training_cfg' not in dir() else 64
+    batch_size_estimate = config.get('training', {}).get('batch_size', 64)
     activation_mem_gb = (batch_size_estimate * max_len * hidden_dim * 4 * 8) / 1e9  # rough 8× factor for autograd
     estimated_peak_gb = optimizer_mem_gb + activation_mem_gb
     logger.info(f"  - Total params: {total_params:,} ({param_mem_gb:.2f} GB)")
@@ -916,12 +928,14 @@ def main():
             # Create fresh models for this fold
             fold_embedding = nn.Embedding(len(src_tokenizer), embedding_dim).to(device)
             fold_tgt_embedding = nn.Embedding(len(tgt_tokenizer), embedding_dim).to(device)
-            fold_rnn = nn.LSTM(embedding_dim, hidden_dim, num_layers, batch_first=True,
-                              dropout=dropout_rate if num_layers > 1 else 0).to(device)
+            fold_encoder_rnn = nn.LSTM(embedding_dim, hidden_dim, num_layers, batch_first=True,
+                                      dropout=dropout_rate if num_layers > 1 else 0).to(device)
+            fold_decoder_rnn = nn.LSTM(embedding_dim, hidden_dim, num_layers, batch_first=True,
+                                      dropout=dropout_rate if num_layers > 1 else 0).to(device)
             fold_attention = AttentionLayer(hidden_dim).to(device)
             fold_decoder = nn.Linear(hidden_dim * 2, len(tgt_tokenizer)).to(device)
             
-            fold_models = [fold_embedding, fold_tgt_embedding, fold_rnn, fold_attention, fold_decoder]
+            fold_models = [fold_embedding, fold_tgt_embedding, fold_encoder_rnn, fold_decoder_rnn, fold_attention, fold_decoder]
             
             # TIER 2 components for this fold
             fold_copy_mechanism = None
@@ -987,7 +1001,7 @@ def main():
         val_src, val_tgt = src_data[num_train:], tgt_data[num_train:]
         
         # Create model
-        models = [embedding, tgt_embedding, rnn, attention, decoder]
+        models = [embedding, tgt_embedding, encoder_rnn, decoder_rnn, attention, decoder_linear]
         
         logger.info(f"  Train samples: {len(train_src)}")
         logger.info(f"  Val samples: {len(val_src)}")
