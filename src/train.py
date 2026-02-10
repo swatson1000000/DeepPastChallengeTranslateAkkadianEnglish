@@ -597,7 +597,7 @@ def train_single(models, optimizer, criterion, config, args, device,
     training_cfg = config.get('training', {})
     batch_size = args.batch_size or training_cfg.get('batch_size', 128)
     learning_rate = float(training_cfg.get('learning_rate', 0.0005))
-    num_epochs = args.epochs or training_cfg.get('epochs', 100)
+    num_epochs = args.epochs or training_cfg.get('epochs', 75)
     use_amp = training_cfg.get('use_amp', False)  # Get from config
     
     logger.info(f"\n{fold_str} | Train samples: {len(train_src)}, Val samples: {len(val_src)}")
