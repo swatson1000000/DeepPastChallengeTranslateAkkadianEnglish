@@ -26,11 +26,11 @@ def main():
     print("  - 30% Translation variations")
     print("  - 20% Segment combinations")
     print("\nCurrent: 1,561 samples")
-    print("Target:  7,805 samples (5x multiplier)")
+    print("Target:  9,756 samples (6.25x multiplier)")
     print("\n" + "="*80)
     
-    # Generate augmented data with 5x multiplier
-    augmented_df = augmentor.augment_training_data(multiplier=5.0)
+    # Generate augmented data with 6.25x multiplier
+    augmented_df = augmentor.augment_training_data(multiplier=6.25)
     
     # Save to file
     output_path = project_root / "data" / "processed" / "train_augmented_5x.csv"

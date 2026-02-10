@@ -285,8 +285,8 @@ def main():
     
     augmentor = DataAugmentor(project_root)
     
-    # Augment training data (5x expansion)
-    augmented_df = augmentor.augment_training_data(multiplier=5.0)
+    # Augment training data (6.25x expansion)
+    augmented_df = augmentor.augment_training_data(multiplier=6.25)
     
     # Save augmented data
     output_path = augmentor.save_augmented_data(augmented_df)
