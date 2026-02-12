@@ -32,7 +32,7 @@ The model must learn from full-document pairs but predict individual sentences.
 
 ---
 
-## Phase 1: Baseline ByT5 (Score target: ~34)
+## Phase 1: Baseline ByT5 (Score target: ~34) ✅ CODE COMPLETE — NEEDS TRAINING & TESTING
 
 ### 1.1 Download & upload pretrained ByT5-small
 - Download `google/byt5-small` weights locally

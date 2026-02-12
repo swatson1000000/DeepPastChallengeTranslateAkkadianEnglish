@@ -1,0 +1,15 @@
+{
+    "id": "swatson1000000/akkadian-byt5-submission",
+    "title": "Akkadian ByT5 Submission",
+    "code_file": "akkadian-byt5-submission.ipynb",
+    "language": "python",
+    "kernel_type": "notebook",
+    "is_private": true,
+    "enable_gpu": true,
+    "enable_tpu": false,
+    "enable_internet": false,
+    "competition": "deep-past-initiative-machine-translation",
+    "dataset_sources": ["swatson1000000/byt5-akkadian-finetuned"],
+    "kernel_sources": [],
+    "model_sources": []
+}

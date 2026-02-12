@@ -35,7 +35,7 @@ wheels/
 
 # Jupyter Notebook
 .ipynb_checkpoints
-*.ipynb
+# Note: jupyter/*.ipynb is tracked for Kaggle submission
 
 # Data files (keep structure, exclude large files)
 /data/raw/*.csv
@@ -46,6 +46,7 @@ wheels/
 /checkpoints/*.pt
 /checkpoints/**/*.pt
 /models/*.pt
+/models/byt5-akkadian/
 /models/mbart_checkpoints/
 /models/mbart50/
 /models/seq2seq/

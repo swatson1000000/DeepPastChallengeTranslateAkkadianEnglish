@@ -2,85 +2,87 @@
 
 ## Overview
 
-Kaggle **code competition** for translating Old Assyrian (Akkadian) transliterations to English. Competition: `deep-past-initiative-machine-translation`. Very small corpus (1,562 training pairs) — data augmentation is critical.
+Kaggle **code competition** translating Old Assyrian (Akkadian) transliterations→English.
+Competition: `deep-past-initiative-machine-translation`. Tiny corpus (1,561 document-level training pairs).
+Current score: 2.7 (LSTM baseline). Target: 36+ (silver medal). Deadline: March 23, 2026.
+
+**Critical constraint**: Training data is document-level, test data is sentence-level.
 
 ## Environment
 
 - **Conda env**: `phi4` — activate before any Python command
-- **GPU**: NVIDIA with 75GB VRAM locally; Kaggle submission limited to 16GB GPU, ≤9 hours
+- **GPU**: NVIDIA GB10 ~80GB VRAM locally; Kaggle submission limited to 16GB GPU, ≤9 hours
 - **Install**: `conda activate phi4 && pip install -r requirements.txt`
 
 ## Code Style
 
 - Python 3, `snake_case` functions/variables, `PascalCase` classes
 - Type hints on function signatures; `logging.getLogger(__name__)` for all logging
-- Docstrings with `Args:` / `Returns:` sections — see `src/train.py` as reference
-- `sys.stdout.reconfigure(line_buffering=True)` for unbuffered output in long-running scripts
+- Docstrings with `Args:` / `Returns:` sections — see `src/train_byt5.py` as reference
+- `sys.stdout.reconfigure(line_buffering=True)` at top of long-running scripts
 
 ## Architecture
 
-**Primary model**: Custom LSTM Seq2Seq with Bahdanau attention, defined inline in `src/train.py` and `src/inference.py`.
+**Primary model**: `google/byt5-small` (300M params) fine-tuned via HuggingFace Transformers.
+Byte-level tokenizer — no vocab mismatch issues with Akkadian Unicode.
 
-Key components (all in `src/train.py`):
-- `SimpleTokenizer` — word-level, special tokens: `<PAD>`=0, `<UNK>`=1, `<SOS>`=2, `<EOS>`=3
-- `AttentionLayer` — Bahdanau attention
-- `CopyMechanism` — pointer-generator (TIER 2)
-- `LexiconConstrainedDecoder` — constrains output with lexicon entries (TIER 2)
-- `LabelSmoothingCrossEntropy` — label smoothing loss
+| File | Purpose |
+|------|---------|
+| `src/train_byt5.py` | Fine-tuning: AdamW, linear warmup, gradient checkpointing, no fp16 |
+| `src/inference.py` | Beam search generation (beams=8, length_penalty=1.3) |
+| `src/preprocess.py` | Transliteration/translation preprocessing + postprocessing |
+| `src/evaluate.py` | Geometric mean of BLEU & chrF++ via sacrebleu |
 
-**Note**: Model classes are duplicated in `src/train.py` and `src/inference.py`. Keep both in sync when modifying architecture.
+Preprocessing is inlined in `jupyter/akkadian-byt5-submission.ipynb` for Kaggle (which cannot import `src/`). **Keep the notebook preprocessing in sync with `src/preprocess.py`.**
 
 ## Data Pipeline
 
 ```
-data/raw/train.csv → src/full_preprocessing.py → data/processed/train_clean.csv
-                   → src/augment_data.py       → data/processed/train_augmented_*.csv
-                   → src/train.py (loads CSV, builds vocab on the fly, trains)
-                   → src/inference.py           → predictions.csv → submission.csv
+data/raw/train.csv ──→ src/preprocess.py ──→ data/processed/train_clean.csv
+                   ──→ src/train_byt5.py (preprocesses inline, fine-tunes ByT5)
+                   ──→ models/byt5-akkadian/best/ (saved checkpoint)
+                   ──→ src/inference.py ──→ submission.csv
 ```
 
-- **Raw columns**: `oare_id`, `transliteration`, `translation` (train); `id`, `transliteration` (test)
-- **Submission format**: CSV with columns `id`, `translation` — file must be named `submission.csv`
-- **Metric**: Geometric mean of BLEU and chrF++ (micro-averaged). Implemented in `src/evaluation.py`.
+- **Train columns**: `oare_id`, `transliteration`, `translation` (1,561 document-level pairs)
+- **Test columns**: `id`, `text_id`, `line_start`, `line_end`, `transliteration` (sentence-level; dummy in download)
+- **Submission**: CSV with `id`, `translation` — named `submission.csv`
+- **Metric**: `sqrt(BLEU * chrF++)` micro-averaged. See `src/evaluate.py`.
+- **Lexicon**: `data/raw/OA_Lexicon_eBL.csv` (39K entries with word type: word/PN/GN)
+- **Alignment aid**: `data/raw/Sentences_Oare_FirstWord_LinNum.csv` (9,782 sentence boundaries)
 
 ## Build and Run
 
 ```bash
-# Training (default: 75 epochs, 3-fold CV)
 conda activate phi4
 cd /home/swatson/work/MachineLearning/kaggle/DeepPastChallengeTranslateAkkadianEnglish
-nohup python src/train.py --model improved --epochs 75 > log/train_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+
+# Training (defaults: 20 epochs, batch=16, max_length=1024, gradient checkpointing)
+nohup python -u src/train_byt5.py --output-dir models/byt5-akkadian > log/train_byt5_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 
 # Inference
-nohup python src/inference.py --model improved --output predictions.csv > log/inference_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+nohup python -u src/inference.py --model models/byt5-akkadian/best > log/inference_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 
-# Kaggle notebook submission
+# Kaggle submission
 cd jupyter && kaggle kernels push -p .
 ```
 
 All scripts MUST run via `nohup` with timestamped logs in `log/`. See `CLAUDE.md` for full execution policy.
 
-## Config Files
-
-YAML configs in `configs/` control model hyperparameters. Train script reads them via `--config`:
-- `model_seq2seq.yaml` — baseline (3-layer bidir LSTM, hidden=768)
-- `model_seq2seq_tier3.yaml` — best config (4-layer, hidden=1024, beam=8)
-- `model_mbart50.yaml` — HuggingFace mBART-50 fine-tuning (secondary approach)
-
-CLI args (`--epochs`, `--batch-size`, `--folds`) override config values.
-
 ## Kaggle Submission
 
-The notebook `jupyter/akkadian-english-seq2seq.ipynb` is the submission artifact:
-- Reads data from `/kaggle/input/deep-past-initiative-machine-translation/`
+Notebook `jupyter/akkadian-byt5-submission.ipynb` is the submission artifact:
+- Loads model from `/kaggle/input/byt5-akkadian-finetuned/best`
+- `jupyter/kernel-metadata.json` configures kernel push (GPU, no internet)
+- `dataset_sources` in metadata must reference the uploaded model dataset
 - Writes `submission.csv` to `/kaggle/working/`
-- GPU enabled, internet disabled, ≤9 hours runtime
-- `jupyter/kernel-metadata.json` configures the Kaggle kernel push
 
 ## Key Conventions
 
-- **Checkpoints**: Saved to `checkpoints/` — component-level (`attention_best.pt`, `rnn_best.pt`) and epoch-level (`seq2seq_epoch_N.pt`)
-- **K-fold**: 3-fold CV by default (`--folds 3`). Fold checkpoints in `checkpoints/fold_N/`
-- **Augmentation**: Up to 30x via lexicon back-translation & paraphrasing. Critical due to tiny dataset
-- **Preprocessing**: Unicode normalization (Ḫ→H), determinative handling, scribal notation removal — see `src/preprocessing.py`
-- **No test suite**: `pytest` is in requirements but no tests exist yet
+- **Checkpoints**: `models/byt5-akkadian/best/` (best val loss), `models/byt5-akkadian/epoch_N/`, `models/byt5-akkadian/final/`
+- **No fp16**: Causes NaN errors with ByT5 — always train in fp32
+- **Preprocessing**: H normalization (Ḫ→H), gap markers (`<gap>`/`<big_gap>`), accent→numbered forms, scribal notation removal. See `src/preprocess.py`
+- **Determinatives**: Keep `{d}`, `{ki}`, `{m}` etc. as-is — they encode semantic meaning
+- **DO NOT use EvaCun/ORACC data**: Neo-Assyrian (wrong era by 1,000 years)
+- **Published test split**: 34% public / 66% private — expect LB shake
+- **Plan**: `plan.md` tracks 5-phase roadmap with timeline and score targets
