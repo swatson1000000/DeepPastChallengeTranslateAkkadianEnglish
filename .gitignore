@@ -92,3 +92,6 @@ kaggle.json
 *.pickle
 *.h5
 *.hdf5
+
+# Large reference data
+/data/1/

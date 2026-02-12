@@ -2,16 +2,14 @@
 """
 Unified inference pipeline for Akkadian-English translation models.
 
-Model trained with optimizations for speed:
-  - Sequence length: 128 tokens (reduced from 256)
-  - Batch size: 512 (doubled from 256)
-  - Mixed precision: fp16 for 2-3x training speedup
-  - K-folds: 3 folds (reduced from 5 for faster ensemble)
-  - Max epochs: 50 with early stopping at overfitting ratio 2.5x
-
-Priority improvements maintained:
-  Priority 1: Dropout (0.3), Weight Decay (1e-4), Gradient Clipping (max_norm=1.0)
-  Priority 2: Label Smoothing (0.1), Early stopping at ratio≤2.5x
+Model trained with settings matched to notebook:
+  - Sequence length: 180 tokens
+  - Batch size: 32
+  - Embedding dim: 256, Hidden dim: 512, 2-layer LSTM
+  - Learning rate: 0.001, Weight decay: 1e-4
+  - K-folds: 3, Max epochs: 75
+  - Label Smoothing (0.1), Gradient Clipping (max_norm=1.0)
+  - Early stopping via overfitting-triggered LR annealing
 
 Supports multiple model variants:
 - baseline: Standard Seq2Seq with LSTM and attention
@@ -341,38 +339,59 @@ class Seq2SeqInference:
             logger.info("✓ Lexicon decoder loaded")
     
     def load_tokenizers(self):
-        """Build tokenizers from training data."""
-        logger.info("Building tokenizers from training data...")
+        """Load tokenizers from checkpoint or rebuild from training data."""
+        checkpoint = torch.load(self.model_path, map_location='cpu')
         
-        # Navigate to project root from checkpoint path
-        # Handles both checkpoints/fold_X/best_model.pt and checkpoints/tier3_best.pt
-        model_path_obj = Path(self.model_path)
-        # Walk up until we find src/ or configs/ directory to identify project root
-        candidate = model_path_obj.parent
-        for _ in range(5):
-            if (candidate / "src").exists() or (candidate / "configs").exists():
-                break
-            candidate = candidate.parent
-        project_root = candidate
-        
-        train_path = project_root / "data/processed/train_augmented.csv"
-        if not train_path.exists():
-            train_path = project_root / "data/processed/train_clean.csv"
-        
-        if not train_path.exists():
-            raise FileNotFoundError(f"Training data not found at {train_path}")
-        
-        df = pd.read_csv(train_path)
-        logger.info(f"Loaded {len(df)} training samples")
-        
-        self.src_tokenizer = SimpleTokenizer()
-        self.tgt_tokenizer = SimpleTokenizer()
-        
-        self.src_tokenizer.build_vocab(df['transliteration'].values)
-        self.tgt_tokenizer.build_vocab(df['translation'].values)
-        
-        logger.info(f"✓ Source vocab: {len(self.src_tokenizer)} tokens")
-        logger.info(f"✓ Target vocab: {len(self.tgt_tokenizer)} tokens")
+        # Prefer loading vocab from checkpoint (saved by updated train.py)
+        if 'src_word2idx' in checkpoint and 'tgt_word2idx' in checkpoint:
+            logger.info("Loading tokenizers from checkpoint...")
+            self.src_tokenizer = SimpleTokenizer()
+            self.src_tokenizer.word2idx = checkpoint['src_word2idx']
+            self.src_tokenizer.idx2word = {int(k) if isinstance(k, str) else k: v
+                                           for k, v in checkpoint['src_idx2word'].items()}
+            self.src_tokenizer.next_idx = max(self.src_tokenizer.word2idx.values()) + 1
+            
+            self.tgt_tokenizer = SimpleTokenizer()
+            self.tgt_tokenizer.word2idx = checkpoint['tgt_word2idx']
+            self.tgt_tokenizer.idx2word = {int(k) if isinstance(k, str) else k: v
+                                           for k, v in checkpoint['tgt_idx2word'].items()}
+            self.tgt_tokenizer.next_idx = max(self.tgt_tokenizer.word2idx.values()) + 1
+            
+            logger.info(f"✓ Source vocab: {len(self.src_tokenizer)} tokens (from checkpoint)")
+            logger.info(f"✓ Target vocab: {len(self.tgt_tokenizer)} tokens (from checkpoint)")
+        else:
+            # Fallback: rebuild from training data (for older checkpoints)
+            logger.info("Building tokenizers from training data (no vocab in checkpoint)...")
+            
+            model_path_obj = Path(self.model_path)
+            candidate = model_path_obj.parent
+            for _ in range(5):
+                if (candidate / "src").exists() or (candidate / "configs").exists():
+                    break
+                candidate = candidate.parent
+            project_root = candidate
+            
+            # Try raw data first (matches current train.py), then processed
+            train_path = project_root / "data/raw/train.csv"
+            if not train_path.exists():
+                train_path = project_root / "data/processed/train_augmented.csv"
+            if not train_path.exists():
+                train_path = project_root / "data/processed/train_clean.csv"
+            
+            if not train_path.exists():
+                raise FileNotFoundError(f"Training data not found")
+            
+            df = pd.read_csv(train_path)
+            logger.info(f"Loaded {len(df)} training samples from {train_path}")
+            
+            self.src_tokenizer = SimpleTokenizer()
+            self.tgt_tokenizer = SimpleTokenizer()
+            
+            self.src_tokenizer.build_vocab(df['transliteration'].values)
+            self.tgt_tokenizer.build_vocab(df['translation'].values)
+            
+            logger.info(f"✓ Source vocab: {len(self.src_tokenizer)} tokens (rebuilt)")
+            logger.info(f"✓ Target vocab: {len(self.tgt_tokenizer)} tokens (rebuilt)")
     
     def greedy_decode(self, encoder_outputs, hidden_state, cell_state=None, src_tokens=None,
                      max_len=180, temperature=0.8, use_copy=False):
@@ -452,7 +471,7 @@ class Seq2SeqInference:
     
     def beam_search_decode(self, encoder_outputs, hidden_state, cell_state=None, src_tokens=None,
                           use_copy: bool = False, beam_width: int = 5, 
-                          max_len: int = 256, temperature: float = 1.0,
+                          max_len: int = 180, temperature: float = 1.0,
                           length_penalty: float = 0.0, coverage_penalty: float = 0.0):
         """
         Beam search decoding with optional copy mechanism.
@@ -681,7 +700,7 @@ def main():
     if args.checkpoint:
         checkpoint_path = args.checkpoint
     else:
-        # Check for fold-based checkpoints first (3 folds from optimized training)
+        # Check for fold-based checkpoints first (3-fold CV)
         fold_dir = project_root / "checkpoints"
         fold_checkpoints = sorted([f for f in fold_dir.glob('fold_*/best_model.pt')])[:3]
         

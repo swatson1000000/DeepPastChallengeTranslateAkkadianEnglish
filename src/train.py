@@ -23,7 +23,7 @@ import argparse
 import numpy as np
 from pathlib import Path
 from datetime import datetime
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import Dict, Tuple, Optional
 from sklearn.model_selection import KFold
 from torch.amp import autocast, GradScaler
@@ -93,7 +93,7 @@ class SimpleTokenizer:
                 self.idx2word[self.next_idx] = word
                 self.next_idx += 1
     
-    def encode(self, text, max_len=256):
+    def encode(self, text, max_len=180):
         """Encode text to tensor."""
         words = text.split()
         indices = [self.word2idx.get(w, 1) for w in words[:max_len-2]]
@@ -252,6 +252,142 @@ def build_valid_token_mask(tokenizer, lexicon_path: Optional[str] = None) -> tor
             logger.warning(f"Could not load lexicon: {e}")
     
     return mask
+
+
+class DataAugmentor:
+    """Augment training data using lexicon-based paraphrasing and variations.
+    
+    Ported from jupyter/akkadian-english-seq2seq.ipynb for consistent
+    inline augmentation between notebook and train.py.
+    """
+    
+    def __init__(self, input_dir: Path):
+        self.input_dir = input_dir
+        self.lexicon = self._load_lexicon()
+    
+    def _load_lexicon(self):
+        """Load OA_Lexicon_eBL.csv and build translation mappings."""
+        lexicon_path = self.input_dir / 'OA_Lexicon_eBL.csv'
+        if not lexicon_path.exists():
+            logger.warning(f'Lexicon not found at {lexicon_path}')
+            return {}
+        
+        lex_df = pd.read_csv(lexicon_path)
+        mappings = defaultdict(set)
+        for _, row in lex_df.iterrows():
+            akkadian = str(row.get('form', '')).strip()
+            english = str(row.get('norm', '')).strip()
+            if akkadian and english and akkadian != 'nan' and english != 'nan':
+                english = english.replace('_', ' ').lower()
+                mappings[akkadian].add(english)
+        
+        logger.info(f'Loaded {len(mappings)} lexicon entries')
+        return mappings
+    
+    def paraphrase_translation(self, translation: str) -> list:
+        """Generate paraphrases via phrase substitution."""
+        paraphrases = [translation]
+        variations = {
+            'of silver': ['of silver', 'in silver', 'from silver'],
+            'minas of': ['minas of', 'mina(s) of', 'minas'],
+            'seal of': ['seal of', 'the seal of', 'seal from'],
+            'said:': ['stated:', 'said:', 'declared:', 'spoke:'],
+            'he said': ['he said', 'saying', 'stating', 'he states'],
+            'gave to': ['gave to', 'presented to', 'transferred to'],
+            'the king': ['the king', 'king', 'his majesty'],
+            'and': ['and', ',', 'plus'],
+            'was': ['was', 'is', 'being'],
+            'made': ['made', 'created', 'produced', 'crafted'],
+        }
+        current = translation
+        for original, replacements in variations.items():
+            if original in current:
+                for replacement in replacements:
+                    if replacement != original:
+                        variant = current.replace(original, replacement, 1)
+                        if variant != translation and len(variant) > 5:
+                            paraphrases.append(variant)
+        # Punctuation/formatting variations
+        punct_variants = [
+            translation.replace(':', ''),
+            translation.replace(',', ';'),
+        ]
+        paraphrases.extend([p for p in punct_variants if p and p != translation])
+        return list(set(paraphrases))[:8]
+    
+    def augment(self, train_df: pd.DataFrame, multiplier: float = 6.25) -> pd.DataFrame:
+        """Augment training data by the given multiplier.
+        
+        Args:
+            train_df: DataFrame with 'transliteration' and 'translation' columns
+            multiplier: Target size as multiple of original (6.25 = 6.25x)
+        
+        Returns:
+            Augmented DataFrame shuffled with random_state=42
+        """
+        original_size = len(train_df)
+        num_synthetic = int(original_size * multiplier) - original_size
+        
+        logger.info(f'Augmenting: {original_size} -> ~{original_size + num_synthetic} samples')
+        synthetic_pairs = []
+        
+        # Strategy 1: Paraphrasing (50%)
+        paraphrase_target = int(num_synthetic * 0.5)
+        remaining = paraphrase_target
+        for _, row in train_df.iterrows():
+            paraphrases = self.paraphrase_translation(row['translation'])
+            for para in paraphrases[1:]:
+                synthetic_pairs.append({
+                    'transliteration': row['transliteration'],
+                    'translation': para
+                })
+                remaining -= 1
+                if remaining <= 0:
+                    break
+            if remaining <= 0:
+                break
+        
+        # Strategy 2: Translation variations (30%)
+        variation_target = int(num_synthetic * 0.3)
+        remaining = variation_target
+        for _, row in train_df.sample(min(remaining, len(train_df)), random_state=42).iterrows():
+            translation = row['translation']
+            for var in [
+                translation.replace('(...)', '[details omitted]'),
+                translation.replace('...', '[continues]'),
+                translation.replace('  ', ' '),
+                translation.replace('[', '(').replace(']', ')'),
+            ]:
+                if var != translation and len(var) > 5:
+                    synthetic_pairs.append({
+                        'transliteration': row['transliteration'],
+                        'translation': var
+                    })
+                    remaining -= 1
+                    if remaining <= 0:
+                        break
+            if remaining <= 0:
+                break
+        
+        # Strategy 3: Segment combination (20%)
+        segment_target = int(num_synthetic * 0.2)
+        for _ in range(min(segment_target, len(train_df))):
+            row1 = train_df.sample(1).iloc[0]
+            row2 = train_df.sample(1).iloc[0]
+            combined_src = f"{row1['transliteration'][:40]} / {row2['transliteration'][:40]}".rstrip('/')
+            combined_tgt = f"{row1['translation']}; {row2['translation']}"
+            if len(combined_src) > 5 and len(combined_tgt) > 10:
+                synthetic_pairs.append({
+                    'transliteration': combined_src,
+                    'translation': combined_tgt
+                })
+        
+        synthetic_df = pd.DataFrame(synthetic_pairs)
+        augmented = pd.concat([train_df[['transliteration', 'translation']], synthetic_df], ignore_index=True)
+        augmented = augmented.sample(frac=1, random_state=42).reset_index(drop=True)
+        
+        logger.info(f'Augmentation complete: {len(augmented)} samples ({len(augmented)/original_size:.1f}x)')
+        return augmented
 
 
 def load_config(config_path: Path) -> Dict:
@@ -589,14 +725,15 @@ def validate(models, criterion, val_data, batch_size, device,
 def train_single(models, optimizer, criterion, config, args, device,
                 train_src, train_tgt, val_src, val_tgt,
                 checkpoint_dir, use_tier2, copy_mechanism, lexicon_decoder,
-                fold_idx: Optional[int] = None) -> float:
+                fold_idx: Optional[int] = None,
+                src_tokenizer=None, tgt_tokenizer=None) -> float:
     """Train a single fold or the main model. Returns best validation loss."""
     
     fold_str = f"Fold {fold_idx + 1}" if fold_idx is not None else "Model"
     
     training_cfg = config.get('training', {})
-    batch_size = args.batch_size or training_cfg.get('batch_size', 128)
-    learning_rate = float(training_cfg.get('learning_rate', 0.0005))
+    batch_size = args.batch_size or training_cfg.get('batch_size', 32)
+    learning_rate = float(training_cfg.get('learning_rate', 0.001))
     num_epochs = args.epochs or training_cfg.get('epochs', 75)
     use_amp = training_cfg.get('use_amp', False)  # Get from config
     
@@ -679,6 +816,13 @@ def train_single(models, optimizer, criterion, config, args, device,
                 'attention': models[4].state_dict(),
                 'decoder': models[5].state_dict(),
             }
+            # Save tokenizer vocabularies so inference uses the exact same vocab
+            if src_tokenizer is not None:
+                checkpoint['src_word2idx'] = src_tokenizer.word2idx
+                checkpoint['src_idx2word'] = src_tokenizer.idx2word
+            if tgt_tokenizer is not None:
+                checkpoint['tgt_word2idx'] = tgt_tokenizer.word2idx
+                checkpoint['tgt_idx2word'] = tgt_tokenizer.idx2word
             if copy_mechanism:
                 checkpoint['copy_mechanism'] = copy_mechanism.state_dict()
             if lexicon_decoder:
@@ -735,8 +879,10 @@ def main():
     parser.add_argument('--use-copy', action='store_true', help='Enable copy mechanism')
     parser.add_argument('--use-lexicon', action='store_true', help='Enable lexicon constraints')
     parser.add_argument('--use-beam-search', action='store_true', help='Enable beam search in inference')
-    parser.add_argument('--data-path', type=str, default='data/processed/train_augmented.csv',
-                       help='Path to training data')
+    parser.add_argument('--data-path', type=str, default='data/raw/train.csv',
+                       help='Path to training data (raw CSV, will be augmented inline)')
+    parser.add_argument('--augment-multiplier', type=float, default=6.25,
+                       help='Data augmentation multiplier (e.g. 6.25 = 6.25x original size)')
     parser.add_argument('--config', type=str, default=None, help='Config file path')
     parser.add_argument('--folds', type=int, default=3, help='Number of k-folds for cross-validation')
     args = parser.parse_args()
@@ -788,8 +934,13 @@ def main():
     if not data_path.exists():
         data_path = project_root / "data/processed/train_clean.csv"
     
-    df = pd.read_csv(data_path)
-    logger.info(f"✓ Loaded {len(df)} samples")
+    raw_df = pd.read_csv(data_path)
+    logger.info(f"✓ Loaded {len(raw_df)} raw samples")
+    
+    # Live augmentation (matches notebook's DataAugmentor)
+    augmentor = DataAugmentor(data_path.parent)
+    df = augmentor.augment(raw_df, multiplier=args.augment_multiplier)
+    logger.info(f"✓ Augmented to {len(df)} samples ({len(df)/len(raw_df):.1f}x)")
     
     # Memory optimization: Enable cuDNN autotuner for better performance
     if torch.cuda.is_available():
@@ -816,7 +967,7 @@ def main():
     # Create model
     logger.info("\nCreating model...")
     encoder_cfg = config.get('encoder', config.get('model', {}).get('encoder', {}))
-    embedding_dim = encoder_cfg.get('embedding_dim', 384)
+    embedding_dim = encoder_cfg.get('embedding_dim', 256)
     hidden_dim = encoder_cfg.get('hidden_size', 512)
     num_layers = encoder_cfg.get('num_layers', 2)
     dropout_rate = encoder_cfg.get('dropout', 0.3)
@@ -847,7 +998,7 @@ def main():
     # Model + gradients + Adam states (2 moments) = 4× params
     optimizer_mem_gb = param_mem_gb * 4
     # Activation memory estimate: batch × seq_len × hidden × overhead_factor
-    batch_size_estimate = config.get('training', {}).get('batch_size', 64)
+    batch_size_estimate = config.get('training', {}).get('batch_size', 32)
     activation_mem_gb = (batch_size_estimate * max_len * hidden_dim * 4 * 8) / 1e9  # rough 8× factor for autograd
     estimated_peak_gb = optimizer_mem_gb + activation_mem_gb
     logger.info(f"  - Total params: {total_params:,} ({param_mem_gb:.2f} GB)")
@@ -875,15 +1026,15 @@ def main():
     # Training setup
     training_cfg = config.get('training', {})
     # Memory optimization: Default batch size reduced from 128 to 64 to save ~50% memory on tensor allocations
-    default_batch_size = training_cfg.get('batch_size', 128)
+    default_batch_size = training_cfg.get('batch_size', 32)
     # If no override, automatically reduce batch size for GPU memory constraints
     if args.batch_size is None and torch.cuda.is_available():
         if total_gpu_mem_gb < 80 or estimated_peak_gb > GPU_MEMORY_LIMIT_GB * 0.9:
             default_batch_size = min(default_batch_size, 32)
             logger.info(f"  Auto-reduced batch size to {default_batch_size} for memory safety")
     batch_size = args.batch_size or default_batch_size
-    learning_rate = float(training_cfg.get('learning_rate', 0.0005))
-    num_epochs = args.epochs or training_cfg.get('epochs', 100)
+    learning_rate = float(training_cfg.get('learning_rate', 0.001))
+    num_epochs = args.epochs or training_cfg.get('epochs', 75)
     early_stop_patience = 8  # Reduced to 8 — val loss plateaued by epoch ~28 in all folds
     
     # Priority 2: Label smoothing loss instead of standard CE loss
@@ -955,7 +1106,8 @@ def main():
                 config, args, device,
                 fold_train_src, fold_train_tgt, fold_val_src, fold_val_tgt,
                 checkpoint_dir, use_tier2, fold_copy_mechanism, fold_lexicon_decoder,
-                fold_idx=fold_idx
+                fold_idx=fold_idx,
+                src_tokenizer=src_tokenizer, tgt_tokenizer=tgt_tokenizer
             )
             
             fold_results.append({
@@ -1010,7 +1162,8 @@ def main():
         best_val_loss = train_single(
             models, optimizer, criterion, config, args, device,
             train_src, train_tgt, val_src, val_tgt,
-            checkpoint_dir, use_tier2, copy_mechanism, lexicon_decoder
+            checkpoint_dir, use_tier2, copy_mechanism, lexicon_decoder,
+            src_tokenizer=src_tokenizer, tgt_tokenizer=tgt_tokenizer
         )
         
         logger.info(f"\nBest validation loss: {best_val_loss:.4f}")
