@@ -209,6 +209,24 @@ This is the officially-suggested path to more training data.
 - Cross-reference proper nouns against lexicon `form`→`norm`→`lexeme` mappings
 - Post-process: ensure proper nouns match normalized publication forms
 
+### 4.5 Onomasticon-based name normalization (NEW — from discussion #668485)
+- **Source**: `data/raw/onomasticon/onomasticon.csv` (6,335 names, 5,973 spelling→name mappings)
+  - Downloaded from `deeppast/old-assyrian-grammars-and-other-resources`
+  - 984 names have multiple spelling variants
+  - 90 names have aliases (alternative canonical forms)
+- **Combined with OA_Lexicon_eBL.csv**: 13,424 PN form→norm + 334 GN form→norm
+- **Coverage**: 2,212 lexicon PN forms found in training transliterations
+- **Strategy**: Build `src/names.py` with:
+  1. Spelling→canonical name lookup from onomasticon + lexicon
+  2. Given transliteration input, identify name tokens (capitalized / preceded by `{m}`, `{d}`, etc.)
+  3. In model output, fuzzy-match name-like tokens against canonical forms
+  4. Replace model's name rendering with canonical spelling
+- **Also in dataset**:
+  - `secondary_sources.csv` (1,346 OCR'd scholarly texts) — potential future data augmentation
+  - `eSAD/` — 23 Akkadian dictionary PDFs by letter
+  - Kouwenberg 2019 OA grammar PDF — reference material
+- **Expected score**: +1–2 points from correct name rendering
+
 ---
 
 ## Phase 5: Kaggle Submission Pipeline
@@ -235,7 +253,16 @@ Notebook flow:
 2. Load & preprocess test.csv
 3. Bucket-batched inference with beam search
 4. Post-process outputs
-5. Write `submission.csv` to `/kaggle/working/`
+5. **Name normalization** (inline `NameNormalizer` from `src/names.py`)
+6. Write `submission.csv` to `/kaggle/working/`
+
+### 5.4 Notebook update checklist (after retraining)
+When deploying a new model + name normalization to Kaggle:
+1. **Inline `NameNormalizer`** — copy class from `src/names.py` into a notebook cell (notebook can't import `src/`)
+2. **Bundle `onomasticon.csv`** into the model dataset upload (`stevewatson999/byt5-akkadian-finetuned`), or upload as a separate dataset and add to `dataset_sources` in `kernel-metadata.json`
+3. **`OA_Lexicon_eBL.csv`** — already available on Kaggle at `/kaggle/input/deep-past-initiative-machine-translation/` (no upload needed)
+4. **Add normalization step** in notebook after translation generation: call `normalize_names(transliteration, prediction)` on each output
+5. **Keep inline preprocessing in sync** with `src/preprocess.py`
 
 ### 5.3 Push to Kaggle
 ```bash

@@ -1,0 +1,26 @@
+============================================================
+SENTENCE ALIGNMENT REPORT
+============================================================
+
+Train documents:                1561
+Sentence boundaries available:   9782
+
+── Splitting Results ──
+Train texts with boundaries:      253
+Train texts without:             1308
+Split failures:                     6
+
+── Output Composition ──
+Sentence pairs from train:       1104
+Sentence pairs from published:   7205
+Document-level pairs kept:       1314
+
+Bad pairs flagged:                158
+
+TOTAL training pairs:            9494
+  - doc-level:                   1314
+  - sent from train:             1101
+  - sent from published:         7079
+
+Data expansion: 1561 → 9494 (6.1x)
+============================================================

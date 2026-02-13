@@ -22,6 +22,7 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, T5ForConditionalGeneration
 
 from preprocess import clean_transliteration, postprocess_prediction
+from names import NameNormalizer
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +117,9 @@ def main():
     model = model.to(device)
     logger.info("Model loaded")
 
+    # Load name normalizer
+    name_normalizer = NameNormalizer()
+
     # Load test data
     logger.info(f"Loading test data from {args.input}")
     test_df = pd.read_csv(args.input)
@@ -144,6 +148,14 @@ def main():
 
     # Post-process
     predictions = [postprocess_prediction(p) for p in predictions]
+
+    # Name normalization using transliteration context
+    transliterations = test_df["transliteration_clean"].tolist()
+    predictions = [
+        name_normalizer.normalize_names(t, p)
+        for t, p in zip(transliterations, predictions)
+    ]
+    logger.info("Name normalization applied")
 
     # Write submission
     submission = pd.DataFrame({

@@ -153,6 +153,16 @@ def train(args: argparse.Namespace) -> None:
     df = pd.read_csv(args.data)
     logger.info(f"Loaded {len(df)} rows")
 
+    # Filter suspect pairs if column exists and flag set
+    if "is_suspect" in df.columns and not args.include_suspect:
+        n_suspect = df["is_suspect"].sum()
+        df = df[~df["is_suspect"]].reset_index(drop=True)
+        logger.info(f"Removed {n_suspect} suspect pairs, {len(df)} remaining")
+
+    # Log data source composition if column exists
+    if "source" in df.columns:
+        logger.info(f"Data composition: {df['source'].value_counts().to_dict()}")
+
     # Preprocess
     df["transliteration"] = df["transliteration"].apply(clean_transliteration)
     df["translation"] = df["translation"].apply(clean_translation)
@@ -341,24 +351,28 @@ def train(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fine-tune ByT5 for Akkadian→English")
-    parser.add_argument("--data", type=str, default="data/raw/train.csv",
-                        help="Path to training CSV")
+    parser.add_argument("--data", type=str, default="data/processed/train_aligned.csv",
+                        help="Path to training CSV (aligned or raw)")
+    parser.add_argument("--exclude-suspect", action="store_true", default=True,
+                        help="Exclude rows flagged as suspect (if is_suspect column exists)")
+    parser.add_argument("--include-suspect", action="store_true", default=False,
+                        help="Include all rows even if flagged as suspect")
     parser.add_argument("--model-name", type=str, default="google/byt5-small",
                         help="Pretrained model name or path")
     parser.add_argument("--output-dir", type=str, default="models/byt5-akkadian",
                         help="Output directory for checkpoints")
-    parser.add_argument("--epochs", type=int, default=20,
+    parser.add_argument("--epochs", type=int, default=25,
                         help="Number of training epochs")
-    parser.add_argument("--batch-size", type=int, default=16,
+    parser.add_argument("--batch-size", type=int, default=32,
                         help="Batch size per device")
-    parser.add_argument("--grad-accum", type=int, default=2,
+    parser.add_argument("--grad-accum", type=int, default=1,
                         help="Gradient accumulation steps")
     parser.add_argument("--lr", type=float, default=5e-5,
                         help="Learning rate")
     parser.add_argument("--weight-decay", type=float, default=0.01,
                         help="Weight decay")
-    parser.add_argument("--max-length", type=int, default=1024,
-                        help="Max sequence length (source and target)")
+    parser.add_argument("--max-length", type=int, default=512,
+                        help="Max sequence length (source and target, covers 94%% of aligned data)")
     parser.add_argument("--gradient-checkpointing", action="store_true", default=True,
                         help="Enable gradient checkpointing (saves VRAM, slight speed cost)")
     parser.add_argument("--seed", type=int, default=42,
