@@ -23,6 +23,7 @@ from transformers import AutoTokenizer, T5ForConditionalGeneration
 
 from preprocess import clean_transliteration, postprocess_prediction
 from names import NameNormalizer
+from gpu_utils import setup_gpu, get_autocast_context, compile_model
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ def generate_translations(
     num_beams: int = 8,
     max_new_tokens: int = 512,
     length_penalty: float = 1.3,
+    autocast_ctx=None,
 ) -> list[str]:
     """Generate translations for a list of input texts.
 
@@ -50,10 +52,15 @@ def generate_translations(
         num_beams: Number of beams for beam search.
         max_new_tokens: Maximum tokens to generate.
         length_penalty: Length penalty for beam search (>1 = longer, <1 = shorter).
+        autocast_ctx: Optional autocast context manager for BF16.
 
     Returns:
         List of generated translation strings.
     """
+    if autocast_ctx is None:
+        from gpu_utils import _nullcontext
+        autocast_ctx = _nullcontext()
+
     model.eval()
     all_predictions = []
 
@@ -68,7 +75,7 @@ def generate_translations(
             return_tensors="pt",
         ).to(device)
 
-        with torch.no_grad():
+        with torch.no_grad(), autocast_ctx:
             outputs = model.generate(
                 **inputs,
                 num_beams=num_beams,
@@ -100,6 +107,10 @@ def main():
                         help="Maximum new tokens to generate")
     parser.add_argument("--length-penalty", type=float, default=1.3,
                         help="Beam search length penalty")
+    parser.add_argument("--bf16", action="store_true", default=False,
+                        help="Use BF16 mixed precision (safe for ByT5)")
+    parser.add_argument("--compile", action="store_true", default=False,
+                        help="Use torch.compile for fused kernels (best on GB10)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -110,11 +121,16 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Device: {device}")
 
+    # GB10-optimized GPU setup
+    gpu_info = setup_gpu(bf16=args.bf16, compile_model_flag=args.compile)
+    autocast_ctx = get_autocast_context(bf16=args.bf16)
+
     # Load model
     logger.info(f"Loading model from {args.model}")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = T5ForConditionalGeneration.from_pretrained(args.model)
     model = model.to(device)
+    model = compile_model(model, enable=args.compile)
     logger.info("Model loaded")
 
     # Load name normalizer
@@ -142,6 +158,7 @@ def main():
         num_beams=args.num_beams,
         max_new_tokens=args.max_new_tokens,
         length_penalty=args.length_penalty,
+        autocast_ctx=autocast_ctx,
     )
     elapsed = time.time() - start
     logger.info(f"Generated {len(predictions)} translations in {elapsed:.1f}s")

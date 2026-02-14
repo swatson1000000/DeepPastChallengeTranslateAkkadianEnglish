@@ -28,10 +28,11 @@ Byte-level tokenizer — no vocab mismatch issues with Akkadian Unicode.
 
 | File | Purpose |
 |------|---------|
-| `src/train_byt5.py` | Fine-tuning: AdamW, linear warmup, gradient checkpointing, no fp16 |
+| `src/train_byt5.py` | Fine-tuning: AdamW, linear warmup, gradient checkpointing, BF16 support |
 | `src/inference.py` | Beam search generation (beams=8, length_penalty=1.3) |
 | `src/preprocess.py` | Transliteration/translation preprocessing + postprocessing |
 | `src/evaluate.py` | Geometric mean of BLEU & chrF++ via sacrebleu |
+| `src/gpu_utils.py` | GB10 GPU optimizations: SDPA, BF16 autocast, torch.compile |
 
 Preprocessing is inlined in `jupyter/akkadian-byt5-submission.ipynb` for Kaggle (which cannot import `src/`). **Keep the notebook preprocessing in sync with `src/preprocess.py`.**
 
@@ -57,8 +58,11 @@ data/raw/train.csv ──→ src/preprocess.py ──→ data/processed/train_cl
 conda activate phi4
 cd /home/swatson/work/MachineLearning/kaggle/DeepPastChallengeTranslateAkkadianEnglish
 
-# Training (defaults: 20 epochs, batch=16, max_length=1024, gradient checkpointing)
+# Training (defaults: 25 epochs, batch=32, max_length=512, gradient checkpointing)
 nohup python -u src/train_byt5.py --output-dir models/byt5-akkadian > log/train_byt5_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+
+# Training with GB10 optimizations (BF16 + fused kernels)
+nohup python -u src/train_byt5.py --bf16 --compile --output-dir models/byt5-akkadian > log/train_byt5_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 
 # Inference
 nohup python -u src/inference.py --model models/byt5-akkadian/best > log/inference_$(date +%Y%m%d_%H%M%S).log 2>&1 &
@@ -80,7 +84,9 @@ Notebook `jupyter/akkadian-byt5-submission.ipynb` is the submission artifact:
 ## Key Conventions
 
 - **Checkpoints**: `models/byt5-akkadian/best/` (best val loss), `models/byt5-akkadian/epoch_N/`, `models/byt5-akkadian/final/`
-- **No fp16**: Causes NaN errors with ByT5 — always train in fp32
+- **No fp16**: Causes NaN errors with ByT5 — FP16 exponent range too small
+- **BF16 is safe**: Same exponent range as FP32, use `--bf16` flag for ~2x throughput on GB10
+- **GB10 optimizations**: `--bf16 --compile` enables BF16 autocast + torch.compile fused kernels. See `src/gpu_utils.py`
 - **Preprocessing**: H normalization (Ḫ→H), gap markers (`<gap>`/`<big_gap>`), accent→numbered forms, scribal notation removal. See `src/preprocess.py`
 - **Determinatives**: Keep `{d}`, `{ki}`, `{m}` etc. as-is — they encode semantic meaning
 - **DO NOT use EvaCun/ORACC data**: Neo-Assyrian (wrong era by 1,000 years)

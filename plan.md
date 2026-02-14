@@ -226,6 +226,121 @@ This is the officially-suggested path to more training data.
   - `eSAD/` — 23 Akkadian dictionary PDFs by letter
   - Kouwenberg 2019 OA grammar PDF — reference material
 - **Expected score**: +1–2 points from correct name rendering
+- **Community report**: Prayag Patel (286th) tested onomasticon name replacement and saw 0.0 gain on public LB — "Model already outputs English names correctly". However, this was tested on the public 3-model ensemble baseline, not on a custom-trained model. Our model may benefit differently since it's trained on aligned data where names may be less memorized.
+
+### 4.6 eBL_Dictionary.csv analysis (NEW — Feb 2026)
+
+**eBL Dictionary**: 19,215 entries, 15,344 with definitions, 10,780 with extractable English glosses.
+
+**Cross-reference with OA Lexicon**:
+- OA Lexicon has 25,574 word entries across 1,751 unique lexemes
+- 807 eBL dictionary entries match OA lexemes → gives us Akkadian→English glossary
+- 11,034 OA word forms can be linked to English translations via lexeme→eBL chain
+
+**Key trade vocabulary mappings verified against training data**:
+
+| Logogram | Occ. | Akkadian lexeme | English |
+|----------|------|-----------------|---------|
+| KÙ.BABBAR | 3391 | kaspu | silver |
+| DUMU | 1932 | mer'u | son |
+| IGI | 1128 | maḫar / šēbu | before / witness |
+| URUDU | 578 | warī'um | copper |
+| AN.NA | 490 | annuku | tin |
+| DINGIR | 345 | ilu | god |
+| SIG₅ | 325 | damiqtu | fine quality |
+| DU₁₀ | 247 | ṭābu | good |
+| DAM | 211 | aššutu | wife |
+| ITU.KAM | 200 | warḫu | month |
+| GAL | 138 | rabiu | chief/great |
+| DIRI | 88 | watāru | excess |
+| ILLAT | 61 | ellutu | caravan |
+| DUG | 55 | karputu | vessel/pot |
+| LUGAL | 28 | šarru | king |
+| DUB | 14 | ṭuppu | tablet |
+
+**Top English words in training translations**: silver (3643), shekels (1621), minas (1537), son (1966), seal (790), textiles (681), tablet (672), copper (618).
+
+**Assessment**: The eBL dictionary is most useful as a **training data augmentation signal** (lexicon-guided tags) or for **post-processing verification**, not direct word-by-word translation. The model learns these mappings through context during fine-tuning.
+
+**Potential use**: Add Sumerian logogram→English hints as prefix tags during training:
+```
+translate Akkadian to English [KÙ.BABBAR=silver] [DUMU=son]: ...transliteration...
+```
+This idea from the "Helper signals from lexicon" discussion thread. Could help with rare logograms the model sees infrequently.
+
+### 4.7 Competition discussion insights (Feb 2026 survey)
+
+**Leaderboard state** (as of Feb 13, 2026):
+- Public plateau at 35.1 — hundreds of competitors using same 3-model ensemble (Assia Benkedia's weighted parameter average)
+- Top tier (36.5–38.1): Likely custom training on private extracted data
+- To break 35.5+: need custom training data, novel techniques, or different ensemble components
+- hongan (#23): "Single model reaching 34.5 with just formatting/preprocessing. Formatting will get you to ~36-37."
+- Jack (#4): "95% is preprocessing/formatting" — but means CAREFUL MANUAL REVIEW of every training document
+- MPWARE (#17): Extracting translations from Larsen PDFs (difficult — OCR quality bad)
+- FML (372nd): Published manually extracted translations from Larsen/AKT volumes
+- Tomorin (485th): Sentence alignment → +3 points (28.4 → 31.4), bidirectional training → +1 (→ 32.4), ensemble → +0.6 (→ 33.0)
+
+**Key validated findings**:
+1. **Sentence alignment = biggest single gain** (+3 points per Tomorin). We already have this ✅
+2. **Formatting/preprocessing gets you to ~36-37** per hongan (#23). We have good preprocessing ✅
+3. **Onomasticon replacement = 0.0 gain** on public LB per Prayag (tested on Assia ensemble). May differ for our model.
+4. **MBR decoding**: Only Hikari_30 testing publicly. 3-4x slower, could improve private LB robustness.
+5. **Private LB shake**: ~60% probability (Aaron Bornstein). Top models are ~40% pattern matchers. Conservative models may rank higher on private LB.
+6. **Top models hallucinate**: Generate generic trade sentences from corpus templates. Reducing hallucination (MBR, better data) matters for private LB.
+7. **Published data**: FML sharing manually extracted translations from AKT volumes — potential additional training data.
+
+**Failed approaches to avoid**:
+- AKK-300m model (outputs only `<big_gap>`, wrong dialect)
+- BetterTransformer (deprecated in Kaggle environment)
+- Submission blending of the same ensemble (0.0 gain)
+- Hyperparameter tuning via Optuna (minimal impact, ~0.4 max)
+
+### 4.8 Ensemble strategy (CONCRETE PLAN)
+
+**Approach**: Weighted parameter averaging of 3 ByT5-small checkpoints trained with different seeds.
+
+**Why this works**: The public 34.9 baseline is literally this technique (3 models merged). Each model learns slightly different representations due to random initialization of the training loop (data shuffling, dropout). Averaging smooths out noise and reduces variance.
+
+**Training plan** (after v2 completes):
+
+| Model | Seed | Start from | LR | Epochs | Output dir |
+|-------|------|------------|-----|--------|-----------|
+| v2 (current) | 42 | v1 best | 3e-5 | 25 | models/byt5-akkadian-aligned-v2/ |
+| v3 | 123 | google/byt5-small | 5e-5 | 50 | models/byt5-akkadian-seed123/ |
+| v4 | 777 | google/byt5-small | 5e-5 | 50 | models/byt5-akkadian-seed777/ |
+
+**Commands** (run sequentially, each ~12 hrs):
+```bash
+# v3 — seed 123
+nohup python -u src/train_byt5.py \
+    --seed 123 --epochs 50 --lr 5e-5 --batch-size 32 \
+    --output-dir models/byt5-akkadian-seed123 \
+    > log/train_byt5_seed123_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+
+# v4 — seed 777
+nohup python -u src/train_byt5.py \
+    --seed 777 --epochs 50 --lr 5e-5 --batch-size 32 \
+    --output-dir models/byt5-akkadian-seed777 \
+    > log/train_byt5_seed777_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+
+# Merge all 3
+python src/ensemble.py \
+    --models models/byt5-akkadian-aligned-v2/best \
+            models/byt5-akkadian-seed123/best \
+            models/byt5-akkadian-seed777/best \
+    --weights 0.4 0.3 0.3 \
+    --output models/byt5-ensemble/
+```
+
+**Timeline**:
+- v2 finishes: ~Feb 14 morning → eval + upload
+- v3 starts: Feb 14 → finishes ~Feb 15
+- v4 starts: Feb 15 → finishes ~Feb 16
+- Ensemble merge + eval: Feb 16
+- Upload + submit: Feb 16-17
+- Time for iteration: Feb 17-March 23
+
+**Weight rationale**: v2 gets 0.4 weight because it continued from v1 (more total training). v3/v4 get 0.3 each. Can tune weights based on individual val scores.
 
 ---
 

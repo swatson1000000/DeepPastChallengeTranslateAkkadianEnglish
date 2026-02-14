@@ -36,6 +36,7 @@ from transformers import (
 )
 
 from preprocess import clean_transliteration, clean_translation
+from gpu_utils import setup_gpu, get_autocast_context, compile_model, log_gpu_info
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +102,7 @@ def validate(
     model: T5ForConditionalGeneration,
     val_loader: DataLoader,
     device: torch.device,
+    autocast_ctx=None,
 ) -> float:
     """Compute average validation loss.
 
@@ -108,6 +110,7 @@ def validate(
         model: The T5 model.
         val_loader: Validation DataLoader.
         device: Torch device.
+        autocast_ctx: Optional autocast context manager for BF16.
 
     Returns:
         Average validation loss.
@@ -122,11 +125,12 @@ def validate(
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
 
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-            )
+            with autocast_ctx:
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                )
             total_loss += outputs.loss.item()
             num_batches += 1
 
@@ -141,12 +145,10 @@ def train(args: argparse.Namespace) -> None:
     Args:
         args: Command-line arguments.
     """
-    # ── Setup ────────────────────────────────────────────────────────────
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Device: {device}")
-    if device.type == "cuda":
-        logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
-        logger.info(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    # ── Setup (GB10-optimized) ────────────────────────────────────────────
+    gpu_info = setup_gpu(bf16=args.bf16, compile_model_flag=args.compile)
+    device = gpu_info["device"]
+    autocast_ctx = get_autocast_context(bf16=args.bf16)
 
     # ── Load data ────────────────────────────────────────────────────────
     logger.info(f"Loading training data from {args.data}")
@@ -193,6 +195,9 @@ def train(args: argparse.Namespace) -> None:
         logger.info("Gradient checkpointing: ENABLED (use_cache=False)")
 
     model = model.to(device)
+
+    # Apply torch.compile for fused kernels (critical for GB10 bandwidth)
+    model = compile_model(model, enable=args.compile)
 
     num_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -261,7 +266,9 @@ def train(args: argparse.Namespace) -> None:
     logger.info(f"  Total steps: {total_steps}")
     logger.info(f"  Warmup steps: {warmup_steps}")
     logger.info(f"  Gradient checkpointing: {args.gradient_checkpointing}")
-    logger.info(f"  FP16: OFF (critical for ByT5)")
+    logger.info(f"  FP16: OFF (causes NaN with ByT5)")
+    logger.info(f"  BF16: {'ON' if args.bf16 else 'OFF'} (safe — same exponent as FP32)")
+    logger.info(f"  torch.compile: {'ON' if args.compile else 'OFF'}")
 
     # ── Training loop ────────────────────────────────────────────────────
     best_val_loss = float("inf")
@@ -281,11 +288,12 @@ def train(args: argparse.Namespace) -> None:
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
 
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-            )
+            with autocast_ctx:
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                )
 
             loss = outputs.loss / args.grad_accum
             loss.backward()
@@ -314,7 +322,7 @@ def train(args: argparse.Namespace) -> None:
             optimizer.zero_grad()
 
         # ── Validation ───────────────────────────────────────────────────
-        val_loss = validate(model, val_loader, device)
+        val_loss = validate(model, val_loader, device, autocast_ctx=autocast_ctx)
         avg_train_loss = epoch_loss / max(num_batches, 1)
         elapsed = time.time() - epoch_start
 
@@ -377,6 +385,10 @@ def parse_args() -> argparse.Namespace:
                         help="Enable gradient checkpointing (saves VRAM, slight speed cost)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
+    parser.add_argument("--bf16", action="store_true", default=False,
+                        help="Use BF16 mixed precision (safe for ByT5, unlike FP16)")
+    parser.add_argument("--compile", action="store_true", default=False,
+                        help="Use torch.compile for fused kernels (best on GB10)")
     return parser.parse_args()
 
 
