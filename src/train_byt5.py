@@ -165,6 +165,20 @@ def train(args: argparse.Namespace) -> None:
     if "source" in df.columns:
         logger.info(f"Data composition: {df['source'].value_counts().to_dict()}")
 
+    # Filter to sentence-level data only (test set is sentence-level)
+    if args.sentence_only and "source" in df.columns:
+        n_before = len(df)
+        df = df[df["source"] != "doc"].reset_index(drop=True)
+        logger.info(f"Sentence-only mode: removed {n_before - len(df)} doc-level pairs, {len(df)} remaining")
+    elif args.doc_weight < 1.0 and "source" in df.columns:
+        # Downsample doc-level pairs
+        doc_mask = df["source"] == "doc"
+        n_docs = doc_mask.sum()
+        n_keep = max(1, int(n_docs * args.doc_weight))
+        doc_indices = df[doc_mask].sample(n=n_keep, random_state=args.seed).index
+        df = df[~doc_mask | df.index.isin(doc_indices)].reset_index(drop=True)
+        logger.info(f"Doc downsampling ({args.doc_weight}): kept {n_keep}/{n_docs} doc pairs, {len(df)} total")
+
     # Preprocess
     df["transliteration"] = df["transliteration"].apply(clean_transliteration)
     df["translation"] = df["translation"].apply(clean_translation)
@@ -389,6 +403,10 @@ def parse_args() -> argparse.Namespace:
                         help="Use BF16 mixed precision (safe for ByT5, unlike FP16)")
     parser.add_argument("--compile", action="store_true", default=False,
                         help="Use torch.compile for fused kernels (best on GB10)")
+    parser.add_argument("--sentence-only", action="store_true", default=False,
+                        help="Train only on sentence-level data (exclude doc-level pairs)")
+    parser.add_argument("--doc-weight", type=float, default=1.0,
+                        help="Fraction of doc-level pairs to keep (0.0-1.0, default: 1.0 = keep all)")
     return parser.parse_args()
 
 

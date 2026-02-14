@@ -5,7 +5,7 @@
 **Deadline**: March 23, 2026 (Entry/Merger deadline: March 16)  
 **Constraints**: Kaggle code competition — GPU notebook ≤9hrs, internet OFF, `submission.csv`  
 **Prizes**: $50,000 total ($15K / $10K / $8K / $7K / $5K / $5K)  
-**Current score**: 2.7 (LSTM baseline)  
+**Current score**: ~23 GeoMean on sentence-level val (v2 model, Feb 14)  
 **Target**: 36+ (silver medal zone)  
 **Participants**: 1,876 teams / 8,619 entrants
 
@@ -436,3 +436,84 @@ DeepPastChallengeTranslateAkkadianEnglish/
 | 3 (Feb 25–Mar 3) | Phase 3 | Sentence alignment, score ~36 |
 | 4 (Mar 4–10) | Phase 4 | Ensemble + advanced techniques, score 37+ |
 | 5 (Mar 11–23) | Phase 5 | Final tuning, robustness testing, final submission |
+
+---
+
+## v2 Evaluation Results & Scoring Gap Analysis (Feb 14, 2026)
+
+### v2 Training Summary
+- **Model**: `byt5-akkadian-aligned-v2/best` (fine-tuned from v1, 25 epochs on 9,336 aligned rows)
+- **Final val_loss**: 0.5320 (improved every epoch except epoch 22)
+- **Training time**: 10.7 hours (25 epochs × ~25 min/epoch)
+
+### Local Eval Scores
+
+| Eval subset | BLEU | chrF++ | GeoMean | Notes |
+|-------------|------|--------|---------|-------|
+| All (n=933) | 6.98 | 25.30 | **13.29** | Dragged down by doc-level pairs |
+| Sentence-only (n=798) | 14.74 | 35.78 | **22.97** | Best proxy for Kaggle test |
+| sent_pub only (n=692) | 16.27 | 37.22 | **24.61** | Highest-quality aligned data |
+| doc only (n=135) | 0.84 | 14.94 | **3.53** | Model can't generate full documents |
+
+**Key insight**: Kaggle test is sentence-level, so real performance is ~23–25, not 13.29.
+
+### Root Causes of Gap (23 → 34+ target)
+
+1. **Under-generation** — Predictions average 75% of reference length; model generates short summaries instead of full translations. Caused by training on mixed doc/sentence data where docs have long refs the model learned to truncate.
+2. **Name/number errors** — Only 22.8% of numbers match exactly, only 26.5% of names fully correct. 699 names missed, 463 hallucinated.
+3. **Paraphrasing** — Model gets the gist but uses different phrasings, killing BLEU (e.g., "your tablet" vs. "your word", "1/2 shekels per month" vs. "at the rate of the colony").
+4. **Doc-level contamination** — 135/933 val pairs are doc-level with GeoMean=3.53, dragging overall score. These don't represent the test format.
+5. **Eval reporting** — Overall GeoMean=13.29 was misleading; sentence-only score of ~23 is the real benchmark.
+
+### 5 Fixes for v3 Training
+
+#### Fix 1: Sentence-only training mode (`--sentence-only`)
+- **Problem**: Doc-level pairs (14% of data) teach the model to generate short summaries
+- **Solution**: Added `--sentence-only` flag to `train_byt5.py` that filters out `source=="doc"` before training
+- **Also added**: `--doc-weight` flag for partial downsampling (e.g., `--doc-weight 0.3` keeps 30% of docs)
+- **Impact**: Model learns correct output length for sentence-level test data
+- **Files changed**: `src/train_byt5.py`
+
+#### Fix 2: Eval reports scores by source type
+- **Problem**: Overall GeoMean=13.29 was misleading — doc pairs crushed the score
+- **Solution**: `eval_local.py` now reports BLEU/chrF++/GeoMean broken down by source (sent_pub, sent_train, doc) plus a "SENTENCE-ONLY" aggregate as best Kaggle LB proxy
+- **Files changed**: `src/eval_local.py`
+
+#### Fix 3: Sentence-only eval split (`--sentence-only`)
+- **Problem**: Val split included doc-level pairs not representative of test
+- **Solution**: Added `--sentence-only` flag to `eval_local.py` that excludes doc-level pairs from the val split entirely (matches training filtering)
+- **Files changed**: `src/eval_local.py`
+
+#### Fix 4: max_new_tokens verified sufficient
+- **Problem**: Suspected output truncation at 512 tokens
+- **Analysis**: Sentence-level translations: mean=79 bytes, p99=299 bytes, only 0.1% exceed 512 bytes. max_new_tokens=512 is adequate.
+- **Root cause**: Under-generation is a model behavior issue from mixed doc/sentence training, not a token limit. Sentence-only training (Fix 1) addresses this directly.
+- **No code change needed**
+
+#### Fix 5: Name normalization in eval pipeline
+- **Problem**: Eval didn't apply name normalization, so predictions had uncorrected name spellings
+- **Analysis**: `NameNormalizer` has 12,348 spelling→name mappings but limited impact on current errors (fuzzy match threshold too strict for most mismatches)
+- **Status**: Already integrated in `eval_local.py` via `--with-names` flag and in `inference.py`
+- **Note**: Name normalizer cannot fix semantic errors (e.g., "Malahum" vs. "the boatman" — that's a translation, not a spelling variant)
+
+### v3 Training Plan
+
+```bash
+# v3: Sentence-only, seed 123, starting from v2 best
+nohup python -u src/train_byt5.py \
+    --model-name models/byt5-akkadian-aligned-v2/best \
+    --output-dir models/byt5-akkadian-v3-sentonly \
+    --sentence-only \
+    --seed 123 \
+    --epochs 25 \
+    --lr 3e-5 \
+    --batch-size 32 \
+    --max-length 512 \
+    > log/train_byt5_v3_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+```
+
+**Expected improvements from sentence-only**:
+- Better output length calibration (no doc truncation behavior)
+- Cleaner val signal (no doc pairs inflating loss)
+- Faster training (~8,180 sentence pairs instead of 9,336 mixed)
+- Estimated score: 28–32 GeoMean (sentence-level eval)

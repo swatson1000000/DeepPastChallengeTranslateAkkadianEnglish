@@ -38,6 +38,7 @@ def get_val_split(
     data_path: str = "data/processed/train_aligned.csv",
     seed: int = 42,
     exclude_suspect: bool = True,
+    sentence_only: bool = False,
 ) -> pd.DataFrame:
     """Reproduce the exact val split from train_byt5.py.
 
@@ -45,6 +46,7 @@ def get_val_split(
         data_path: Path to training CSV.
         seed: Random seed (must match train_byt5.py).
         exclude_suspect: Whether to exclude suspect pairs.
+        sentence_only: If True, exclude doc-level pairs before splitting.
 
     Returns:
         DataFrame with val split rows (preprocessed transliteration + raw translation).
@@ -56,6 +58,12 @@ def get_val_split(
         n_before = len(df)
         df = df[~df["is_suspect"]].reset_index(drop=True)
         logger.info(f"Removed {n_before - len(df)} suspect pairs, {len(df)} remaining")
+
+    # Filter to sentence-level only (matches --sentence-only training mode)
+    if sentence_only and "source" in df.columns:
+        n_before = len(df)
+        df = df[df["source"] != "doc"].reset_index(drop=True)
+        logger.info(f"Sentence-only mode: removed {n_before - len(df)} doc-level pairs, {len(df)} remaining")
 
     # Keep raw translation for reference scoring
     df["translation_raw"] = df["translation"].copy()
@@ -196,6 +204,8 @@ def main():
                         help="Use BF16 mixed precision (safe for ByT5)")
     parser.add_argument("--compile", action="store_true", default=False,
                         help="Use torch.compile for fused kernels (best on GB10)")
+    parser.add_argument("--sentence-only", action="store_true", default=False,
+                        help="Evaluate only on sentence-level data (exclude doc-level)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -214,7 +224,7 @@ def main():
         logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
 
     # ── Val split ────────────────────────────────────────────────────────
-    val_df = get_val_split(args.data, args.seed)
+    val_df = get_val_split(args.data, args.seed, sentence_only=args.sentence_only)
 
     # ── Load model ───────────────────────────────────────────────────────
     logger.info(f"Loading model from {args.model}")
@@ -258,10 +268,38 @@ def main():
 
     results = compute_metric(predictions, references)
     logger.info("=" * 60)
+    logger.info(f"  ALL DATA (n={len(predictions)})")
     logger.info(f"  BLEU:     {results['bleu']:.2f}")
     logger.info(f"  chrF++:   {results['chrf']:.2f}")
     logger.info(f"  GeoMean:  {results['score']:.2f}")
     logger.info("=" * 60)
+
+    # ── Score by source (sentence vs doc) ────────────────────────────────
+    if "source" in val_df.columns:
+        sources = val_df["source"].values
+        for src in sorted(val_df["source"].unique()):
+            mask = sources == src
+            src_preds = [p for p, m in zip(predictions, mask) if m]
+            src_refs = [r for r, m in zip(references, mask) if m]
+            if src_preds:
+                src_results = compute_metric(src_preds, src_refs)
+                logger.info(f"  {src} (n={len(src_preds)}): "
+                            f"BLEU={src_results['bleu']:.2f} "
+                            f"chrF++={src_results['chrf']:.2f} "
+                            f"GeoMean={src_results['score']:.2f}")
+
+        # Sentence-only score (most representative of Kaggle test)
+        sent_mask = sources != "doc"
+        sent_preds = [p for p, m in zip(predictions, sent_mask) if m]
+        sent_refs = [r for r, m in zip(references, sent_mask) if m]
+        if sent_preds:
+            sent_results = compute_metric(sent_preds, sent_refs)
+            logger.info("-" * 60)
+            logger.info(f"  SENTENCE-ONLY (n={len(sent_preds)}) — best proxy for Kaggle LB")
+            logger.info(f"  BLEU:     {sent_results['bleu']:.2f}")
+            logger.info(f"  chrF++:   {sent_results['chrf']:.2f}")
+            logger.info(f"  GeoMean:  {sent_results['score']:.2f}")
+        logger.info("=" * 60)
 
     # ── Show samples ─────────────────────────────────────────────────────
     for i in range(min(10, len(predictions))):
