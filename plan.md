@@ -584,3 +584,77 @@ nohup python -u src/train_byt5.py \
 | Post-processing | Strip + 'broken text' fallback only |
 
 **Expected score**: 25–32 single model (vs. 13.9 for v2/v3)
+
+---
+
+## ★ NEXT STEPS — Priority-Ordered Action Plan (Feb 14, 2026)
+
+Baseline training completed: 30 epochs, val_loss=0.6417, local eval GeoMean=5.11 (doc-level).
+Val loss was still dropping at epoch 30 — model hasn't fully converged.
+
+### Step 1: Submit baseline to Kaggle (30 min) — IN PROGRESS
+Upload `models/byt5-baseline/best` as Kaggle dataset `stevewatson999/byt5-akkadian-finetuned`.
+Push notebook. See where this replica of the proven starter lands.
+Notebook already configured: raw text, beams=4, length_penalty=1.0.
+
+### Step 2: Train seed variants + ensemble (highest ROI, ~2 days)
+The public baseline's 34.9 score comes from **3-model weighted parameter average**.
+Train 2 more seeds with identical config but different data shuffling:
+
+```bash
+# Seed 123
+nohup python -u src/train_byt5.py \
+    --data data/raw/train.csv --model-name google/byt5-small \
+    --output-dir models/byt5-baseline-seed123 \
+    --optimizer adafactor --lr 1e-4 --label-smoothing 0.2 \
+    --bidirectional --no-preprocess \
+    --epochs 30 --batch-size 1 --grad-accum 8 --max-length 512 \
+    --seed 123 --bf16 \
+    > log/train_byt5_seed123_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+
+# Seed 777
+nohup python -u src/train_byt5.py \
+    --data data/raw/train.csv --model-name google/byt5-small \
+    --output-dir models/byt5-baseline-seed777 \
+    --optimizer adafactor --lr 1e-4 --label-smoothing 0.2 \
+    --bidirectional --no-preprocess \
+    --epochs 30 --batch-size 1 --grad-accum 8 --max-length 512 \
+    --seed 777 --bf16 \
+    > log/train_byt5_seed777_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+
+# Merge all 3
+python src/ensemble.py \
+    --models models/byt5-baseline/best \
+            models/byt5-baseline-seed123/best \
+            models/byt5-baseline-seed777/best \
+    --weights 0.34 0.33 0.33 \
+    --output models/byt5-ensemble/
+```
+
+Expected: 30 → 33-35 with ensemble alone.
+
+### Step 3: Train longer (40-50 epochs)
+Val loss was still dropping at epoch 30 (0.6417). The model hasn't converged.
+Training to 50 epochs could squeeze another 1-2 points.
+
+### Step 4: Tune inference hyperparameters
+- Test `num_beams` = {4, 8, 12} and `length_penalty` = {0.8, 1.0, 1.2, 1.5}
+- Repetition penalty, no_repeat_ngram_size
+- MBR decoding (generate diverse candidates, pick consensus)
+
+### Step 5: Sentence-aligned raw data training
+v2/v3 failed on Kaggle because preprocessing created train/test mismatch.
+Smarter approach: use sentence-aligned data but **without preprocessing** (raw transliterations).
+This gives more and cleaner pairs (9K+) while matching test format.
+
+### Score Tracker
+
+| Model | Config | Val Loss | Local GeoMean | Kaggle LB |
+|-------|--------|----------|---------------|-----------|
+| v1 (aligned) | preprocessed, aligned | — | — | — |
+| v2 (aligned-v2) | preprocessed, from v1 | 0.532 | 22.97 (sent) | 13.9 |
+| v3 (sent-only) | preprocessed, sent-only | — | — | 13.9 |
+| **baseline** | raw text, bidi, Adafactor | 0.642 | 5.11 (doc) | **pending** |
+| baseline-seed123 | same + seed 123 | — | — | — |
+| baseline-seed777 | same + seed 777 | — | — | — |
+| ensemble (3x) | weighted avg | — | — | — |
