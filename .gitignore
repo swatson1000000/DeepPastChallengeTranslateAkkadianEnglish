@@ -41,12 +41,20 @@ wheels/
 /data/raw/*.csv
 /data/processed/*.csv
 /data/augmented/
+/data/raw/onomasticon/CAD_open-20250404T234217Z-001/
+/data/raw/onomasticon/eSAD/
+/data/raw/onomasticon/*.pdf
+/data/raw/onomasticon/secondary_sources.csv
 
 # Model checkpoints and weights
 /checkpoints/*.pt
 /checkpoints/**/*.pt
 /models/*.pt
 /models/byt5-akkadian/
+/models/byt5-akkadian-aligned/
+/models/byt5-akkadian-aligned-v2/
+/models/byt5-akkadian-v3-sentonly/
+/models/byt5-baseline/
 /models/mbart_checkpoints/
 /models/mbart50/
 /models/seq2seq/

@@ -517,3 +517,70 @@ nohup python -u src/train_byt5.py \
 - Cleaner val signal (no doc pairs inflating loss)
 - Faster training (~8,180 sentence pairs instead of 9,336 mixed)
 - Estimated score: 28–32 GeoMean (sentence-level eval)
+
+---
+
+## ★ BEST CURRENT — Baseline-Matched Training (2026-02-14 03:37 UTC)
+
+**Rationale**: v2 and v3 both scored **13.9** on Kaggle LB. Root cause analysis revealed critical mismatches with the proven public baseline (Takamichi Toda's DPC Starter, scoring ~30+ single model / ~34.9 ensemble). This config replicates that baseline exactly.
+
+**Key changes from v2/v3**:
+1. **No preprocessing** — raw transliterations (preprocessing created train/test mismatch)
+2. **Adafactor optimizer** (not AdamW) with fixed LR 1e-4
+3. **Label smoothing 0.2** (manual CrossEntropyLoss, since T5 config doesn't support it)
+4. **Bidirectional training** — English→Akkadian reverse pairs (2x data: 2810 train, ~312 val)
+5. **Fresh google/byt5-small** — no inherited overfitting from v1→v2→v3
+
+```bash
+# BEST CURRENT — baseline-matched training (started 2026-02-14 03:37)
+nohup python -u src/train_byt5.py \
+    --data data/raw/train.csv \
+    --model-name google/byt5-small \
+    --output-dir models/byt5-baseline \
+    --optimizer adafactor \
+    --lr 1e-4 \
+    --label-smoothing 0.2 \
+    --bidirectional \
+    --no-preprocess \
+    --epochs 30 \
+    --batch-size 1 \
+    --grad-accum 8 \
+    --max-length 512 \
+    --seed 42 \
+    --bf16 \
+    > log/train_byt5_baseline_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+```
+
+**Training config summary**:
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| Model | `google/byt5-small` (300M params) | Fresh pretrained, no prior fine-tuning |
+| Data | `data/raw/train.csv` (1561 rows) | Raw text, no preprocessing |
+| Optimizer | Adafactor (fixed LR) | Matches public baseline |
+| Learning rate | 1e-4 | 3x higher than v2/v3's 3e-5 |
+| Label smoothing | 0.2 | Via manual CrossEntropyLoss |
+| Bidirectional | Yes | Akk→Eng + Eng→Akk (2810 train pairs) |
+| Batch size | 1 (effective 8 via grad_accum=8) | Matches baseline exactly |
+| Epochs | 30 | |
+| Max length | 512 | |
+| Warmup steps | 1053 (10% of 10,530 total) | |
+| Precision | BF16 autocast | Safe for ByT5 (same exponent as FP32) |
+| Gradient checkpointing | Yes | |
+| Preprocessing | OFF | Raw transliterations |
+| Seed | 42 | |
+| Output | `models/byt5-baseline/` | |
+
+**Inference config** (notebook updated):
+
+| Parameter | Value |
+|-----------|-------|
+| Beams | 4 (not 8) |
+| Length penalty | 1.0 (neutral) |
+| Batch size | 8 |
+| Max input length | 512 |
+| Max new tokens | 512 |
+| Test preprocessing | None (raw text) |
+| Post-processing | Strip + 'broken text' fallback only |
+
+**Expected score**: 25–32 single model (vs. 13.9 for v2/v3)

@@ -33,6 +33,7 @@ from transformers import (
     AutoTokenizer,
     T5ForConditionalGeneration,
     get_linear_schedule_with_warmup,
+    Adafactor,
 )
 
 from preprocess import clean_transliteration, clean_translation
@@ -54,6 +55,7 @@ class AkkadianDataset(Dataset):
         max_source_length: int = 512,
         max_target_length: int = 512,
         prefix: str = "translate Akkadian to English: ",
+        directions: list[str] | None = None,
     ):
         self.transliterations = transliterations
         self.translations = translations
@@ -61,12 +63,16 @@ class AkkadianDataset(Dataset):
         self.max_source_length = max_source_length
         self.max_target_length = max_target_length
         self.prefix = prefix
+        self.directions = directions
 
     def __len__(self) -> int:
         return len(self.transliterations)
 
     def __getitem__(self, idx: int) -> dict:
-        source = self.prefix + self.transliterations[idx]
+        if self.directions is not None and self.directions[idx] == "bwd":
+            source = "translate English to Akkadian: " + self.transliterations[idx]
+        else:
+            source = self.prefix + self.transliterations[idx]
         target = self.translations[idx]
 
         source_encoding = self.tokenizer(
@@ -179,9 +185,14 @@ def train(args: argparse.Namespace) -> None:
         df = df[~doc_mask | df.index.isin(doc_indices)].reset_index(drop=True)
         logger.info(f"Doc downsampling ({args.doc_weight}): kept {n_keep}/{n_docs} doc pairs, {len(df)} total")
 
-    # Preprocess
-    df["transliteration"] = df["transliteration"].apply(clean_transliteration)
-    df["translation"] = df["translation"].apply(clean_translation)
+    # Preprocess (skip if --no-preprocess to match baseline approach)
+    if args.no_preprocess:
+        logger.info("Skipping preprocessing (raw text mode)")
+        df["transliteration"] = df["transliteration"].astype(str)
+        df["translation"] = df["translation"].astype(str)
+    else:
+        df["transliteration"] = df["transliteration"].apply(clean_transliteration)
+        df["translation"] = df["translation"].apply(clean_translation)
     df = df[df["transliteration"].str.len() > 0].reset_index(drop=True)
     df = df[df["translation"].str.len() > 0].reset_index(drop=True)
     logger.info(f"After preprocessing: {len(df)} rows")
@@ -197,10 +208,31 @@ def train(args: argparse.Namespace) -> None:
     val_df = df.iloc[val_indices].reset_index(drop=True)
     logger.info(f"Train: {len(train_df)}, Val: {len(val_df)}")
 
+    # Bidirectional training: add English→Akkadian pairs (2x data, acts as regularization)
+    if args.bidirectional:
+        bwd_df = train_df.rename(columns={"transliteration": "_trans", "translation": "_transl"})
+        bwd_df = bwd_df.rename(columns={"_trans": "translation", "_transl": "transliteration"})
+        # Mark direction so dataset can use correct prefix
+        train_df = train_df.copy()
+        train_df["_direction"] = "fwd"
+        bwd_df["_direction"] = "bwd"
+        train_df = pd.concat([train_df, bwd_df], ignore_index=True)
+        train_df = train_df.sample(frac=1, random_state=args.seed).reset_index(drop=True)
+        logger.info(f"Bidirectional training: {len(train_df)} total pairs (2x)")
+
     # ── Model & tokenizer ────────────────────────────────────────────────
     logger.info(f"Loading model: {args.model_name}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     model = T5ForConditionalGeneration.from_pretrained(args.model_name)
+
+    # Label smoothing: manually compute loss with smoothing
+    label_smoothing = args.label_smoothing
+    if label_smoothing > 0:
+        logger.info(f"Label smoothing: {label_smoothing} (manual CrossEntropyLoss)")
+        loss_fct = torch.nn.CrossEntropyLoss(
+            ignore_index=-100,
+            label_smoothing=label_smoothing,
+        )
 
     # Enable gradient checkpointing to trade compute for memory
     if args.gradient_checkpointing:
@@ -218,12 +250,14 @@ def train(args: argparse.Namespace) -> None:
     logger.info(f"Parameters: {num_params:,} total, {trainable_params:,} trainable")
 
     # ── Datasets & DataLoaders ───────────────────────────────────────────
+    train_directions = train_df["_direction"].tolist() if "_direction" in train_df.columns else None
     train_dataset = AkkadianDataset(
         transliterations=train_df["transliteration"].tolist(),
         translations=train_df["translation"].tolist(),
         tokenizer=tokenizer,
         max_source_length=args.max_length,
         max_target_length=args.max_length,
+        directions=train_directions,
     )
 
     val_dataset = AkkadianDataset(
@@ -254,11 +288,23 @@ def train(args: argparse.Namespace) -> None:
     )
 
     # ── Optimizer & scheduler ────────────────────────────────────────────
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
+    if args.optimizer == "adafactor":
+        optimizer = Adafactor(
+            model.parameters(),
+            lr=args.lr,
+            scale_parameter=False,
+            relative_step=False,
+            warmup_init=False,
+            weight_decay=args.weight_decay,
+        )
+        logger.info("Optimizer: Adafactor (fixed LR)")
+    else:
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
+        logger.info("Optimizer: AdamW")
 
     total_steps = (len(train_loader) // args.grad_accum) * args.epochs
     warmup_steps = int(total_steps * 0.1)
@@ -283,6 +329,10 @@ def train(args: argparse.Namespace) -> None:
     logger.info(f"  FP16: OFF (causes NaN with ByT5)")
     logger.info(f"  BF16: {'ON' if args.bf16 else 'OFF'} (safe — same exponent as FP32)")
     logger.info(f"  torch.compile: {'ON' if args.compile else 'OFF'}")
+    logger.info(f"  Optimizer: {args.optimizer}")
+    logger.info(f"  Label smoothing: {args.label_smoothing}")
+    logger.info(f"  Bidirectional: {args.bidirectional}")
+    logger.info(f"  Preprocessing: {'OFF (raw text)' if args.no_preprocess else 'ON'}")
 
     # ── Training loop ────────────────────────────────────────────────────
     best_val_loss = float("inf")
@@ -308,11 +358,18 @@ def train(args: argparse.Namespace) -> None:
                     attention_mask=attention_mask,
                     labels=labels,
                 )
+                # Apply label smoothing manually if set
+                if label_smoothing > 0:
+                    logits = outputs.logits
+                    smooth_loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
+                    raw_loss = smooth_loss
+                else:
+                    raw_loss = outputs.loss
 
-            loss = outputs.loss / args.grad_accum
+            loss = raw_loss / args.grad_accum
             loss.backward()
 
-            epoch_loss += outputs.loss.item()
+            epoch_loss += raw_loss.item()
             num_batches += 1
 
             if step % args.grad_accum == 0:
@@ -407,6 +464,14 @@ def parse_args() -> argparse.Namespace:
                         help="Train only on sentence-level data (exclude doc-level pairs)")
     parser.add_argument("--doc-weight", type=float, default=1.0,
                         help="Fraction of doc-level pairs to keep (0.0-1.0, default: 1.0 = keep all)")
+    parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "adafactor"],
+                        help="Optimizer (adamw or adafactor)")
+    parser.add_argument("--label-smoothing", type=float, default=0.0,
+                        help="Label smoothing factor (0.0-1.0, baseline uses 0.2)")
+    parser.add_argument("--bidirectional", action="store_true", default=False,
+                        help="Add reverse (Eng→Akk) training pairs (2x data, regularization)")
+    parser.add_argument("--no-preprocess", action="store_true", default=False,
+                        help="Skip preprocessing (use raw text, matches baseline approach)")
     return parser.parse_args()
 
 
