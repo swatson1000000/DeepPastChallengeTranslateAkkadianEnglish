@@ -654,7 +654,8 @@ This gives more and cleaner pairs (9K+) while matching test format.
 | v1 (aligned) | preprocessed, aligned | — | — | — |
 | v2 (aligned-v2) | preprocessed, from v1 | 0.532 | 22.97 (sent) | 13.9 |
 | v3 (sent-only) | preprocessed, sent-only | — | — | 13.9 |
-| **baseline** | raw text, bidi, Adafactor | 0.642 | 5.11 (doc) | **pending** |
-| baseline-seed123 | same + seed 123 | — | — | — |
-| baseline-seed777 | same + seed 777 | — | — | — |
-| ensemble (3x) | weighted avg | — | — | — |
+| **baseline** | raw text, bidi, Adafactor, 30ep | 0.642 | 5.11 (doc) | **21.3** |
+| baseline-seed42 | same + 40ep | 0.612 | — | — |
+| baseline-seed123 | same + seed 123, 40ep | 0.651 | — | — |
+| baseline-seed777 | same + seed 777, 40ep | 0.596 | — | — |
+| **ensemble (3x)** | weighted avg (42/123/777) | — | — | **23.5** |
