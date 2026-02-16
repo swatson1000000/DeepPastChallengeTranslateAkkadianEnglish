@@ -36,9 +36,9 @@ def generate_translations(
     texts: list[str],
     device: torch.device,
     batch_size: int = 4,
-    num_beams: int = 8,
+    num_beams: int = 4,
     max_new_tokens: int = 512,
-    length_penalty: float = 1.3,
+    length_penalty: float = 2.0,
     autocast_ctx=None,
 ) -> list[str]:
     """Generate translations for a list of input texts.
@@ -82,7 +82,6 @@ def generate_translations(
                 max_new_tokens=max_new_tokens,
                 length_penalty=length_penalty,
                 early_stopping=True,
-                no_repeat_ngram_size=3,
             )
 
         decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
@@ -101,12 +100,12 @@ def main():
                         help="Output CSV path")
     parser.add_argument("--batch-size", type=int, default=4,
                         help="Inference batch size")
-    parser.add_argument("--num-beams", type=int, default=8,
+    parser.add_argument("--num-beams", type=int, default=4,
                         help="Number of beams for beam search")
     parser.add_argument("--max-new-tokens", type=int, default=512,
                         help="Maximum new tokens to generate")
-    parser.add_argument("--length-penalty", type=float, default=1.3,
-                        help="Beam search length penalty")
+    parser.add_argument("--length-penalty", type=float, default=2.0,
+                        help="Beam search length penalty (>1 encourages longer output)")
     parser.add_argument("--bf16", action="store_true", default=False,
                         help="Use BF16 mixed precision (safe for ByT5)")
     parser.add_argument("--compile", action="store_true", default=False,
