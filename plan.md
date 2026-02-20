@@ -587,75 +587,102 @@ nohup python -u src/train_byt5.py \
 
 ---
 
-## ★ NEXT STEPS — Priority-Ordered Action Plan (Feb 14, 2026)
+## ★ NEXT STEPS — Revised Strategy (Feb 19, 2026)
 
-Baseline training completed: 30 epochs, val_loss=0.6417, local eval GeoMean=5.11 (doc-level).
-Val loss was still dropping at epoch 30 — model hasn't fully converged.
+### Current Best: 23.8 Kaggle LB (3x ensemble + LENGTH_PENALTY=2.0)
+- Model: `models/byt5-ensemble` (weighted avg of seeds 42/123/777, trained 40ep each)
+- Config: batch=1, grad_accum=8, Adafactor lr=1e-4, label_smoothing=0.2, bidi, raw text
+- Inference: beams=4, length_penalty=2.0
+- Public baseline (Toda's DPC Starter): **34.9** with same architecture → **11-point gap to close**
 
-### Step 1: Submit baseline to Kaggle (30 min) — IN PROGRESS
-Upload `models/byt5-baseline/best` as Kaggle dataset `stevewatson999/byt5-akkadian-finetuned`.
-Push notebook. See where this replica of the proven starter lands.
-Notebook already configured: raw text, beams=4, length_penalty=1.0.
+### Lessons Learned
+- **HF Trainer experiment (batch=128) FAILED** — scored 18.2 (regression from 23.8). Large batches destroy generalization on tiny datasets. With 2,800 bidirectional pairs, batch=128 gives only 22 gradient updates/epoch vs ~350 at batch=8. Stick to batch=1, grad_accum=8.
+- **Preprocessing creates train/test mismatch** — v2/v3 scored 13.9 on Kaggle despite 22.97 local GeoMean. Raw text is mandatory.
+- **LENGTH_PENALTY=2.0 >> 1.0** — inference sweep confirmed +3.7 GeoMean on val.
+- **no_repeat_ngram_size destroys byte-level output** — 3 bytes < 1 word, too aggressive.
 
-### Step 2: Train seed variants + ensemble (highest ROI, ~2 days)
-The public baseline's 34.9 score comes from **3-model weighted parameter average**.
-Train 2 more seeds with identical config but different data shuffling:
+### Public Baseline Analysis (Feb 19, 2026)
+
+Downloaded and analyzed Takamichi Toda's DPC Starter notebook (34.9 on Kaggle LB).
+Same architecture as ours (ByT5-small, 3-seed ensemble, weight-averaged), but critical training differences:
+
+| Parameter | Our train_byt5.py | Public Baseline (Toda) | Impact |
+|-----------|-------------------|------------------------|--------|
+| Optimizer | Adafactor, fixed LR, manual warmup/decay | HF `optim="adafactor"` (relative_step=False, scale_parameter=False, linear decay scheduler) | **Major** — HF Trainer manages LR schedule properly |
+| Padding | Fixed `max_length=512` for all samples | `DataCollatorForSeq2Seq` (dynamic, pads to longest in batch) | **Moderate** — eliminates wasted compute on padding tokens |
+| Label smoothing | Manual CrossEntropyLoss | `label_smoothing_factor=0.2` native in Trainer | **Minor** — cleaner implementation, may behave slightly differently |
+| Eval metrics | Only val loss | `predict_with_generate=True` → BLEU/chrF++ per epoch | **Diagnostic** — better model selection signal |
+| Best model | Save lowest val loss | `load_best_model_at_end=True`, `metric_for_best_model="eval_loss"` | **Minor** — same criterion but HF handles it natively |
+| Sentence aligner | N/A | `simple_sentence_aligner()` — produces **0 splits** (1,561→1,561) | **None** — baseline trains on same 1,561 doc-level pairs |
+
+**Key insight**: The gap is in training mechanics, NOT data. Toda's baseline trains on the exact same 1,561 doc-level pairs and scores 34.9. Our custom training loop has subtle bugs in LR scheduling, loss computation, or optimization that cost us ~11 points.
+
+### Step 1: HF Seq2SeqTrainer baseline-matched training (HIGHEST ROI)
+
+New training script `src/train_matched.py` uses HF Seq2SeqTrainer to match Toda's baseline exactly.
+Ensemble script: `scripts/train_matched_ensemble.sh` (3 seeds → weight-averaged merge).
+
+**Training config** (`src/train_matched.py`):
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| Framework | HF `Seq2SeqTrainer` | Replaces custom training loop |
+| Model | `google/byt5-small` (300M params) | Fresh pretrained |
+| Data | `data/raw/train.csv` (1,561 rows) | Raw text, no preprocessing |
+| Optimizer | `optim="adafactor"` | HF sets relative_step=False, scale_parameter=False |
+| LR | 1e-4 with linear decay | HF default scheduler |
+| Label smoothing | 0.2 | Native `label_smoothing_factor` in Trainer |
+| Batch size | 1 (effective 8 via grad_accum=8) | Matches baseline exactly |
+| Padding | `DataCollatorForSeq2Seq` | Dynamic padding per batch |
+| Epochs | 20 | |
+| Bidirectional | Yes | Akk→Eng + Eng→Akk doubles data |
+| Max length | 512 | |
+| Precision | BF16 | Safe for ByT5 |
+| Gradient checkpointing | Yes | |
+| Eval | `predict_with_generate=True` | BLEU/chrF++/GeoMean per epoch |
+| Model selection | `load_best_model_at_end=True` | Best val loss |
+| Weight decay | 0.01 | |
+| Seeds | 42, 123, 777 | 3-seed ensemble |
 
 ```bash
-# Seed 123
-nohup python -u src/train_byt5.py \
-    --data data/raw/train.csv --model-name google/byt5-small \
-    --output-dir models/byt5-baseline-seed123 \
-    --optimizer adafactor --lr 1e-4 --label-smoothing 0.2 \
-    --bidirectional --no-preprocess \
-    --epochs 30 --batch-size 1 --grad-accum 8 --max-length 512 \
-    --seed 123 --bf16 \
-    > log/train_byt5_seed123_$(date +%Y%m%d_%H%M%S).log 2>&1 &
-
-# Seed 777
-nohup python -u src/train_byt5.py \
-    --data data/raw/train.csv --model-name google/byt5-small \
-    --output-dir models/byt5-baseline-seed777 \
-    --optimizer adafactor --lr 1e-4 --label-smoothing 0.2 \
-    --bidirectional --no-preprocess \
-    --epochs 30 --batch-size 1 --grad-accum 8 --max-length 512 \
-    --seed 777 --bf16 \
-    > log/train_byt5_seed777_$(date +%Y%m%d_%H%M%S).log 2>&1 &
-
-# Merge all 3
-python src/ensemble.py \
-    --models models/byt5-baseline/best \
-            models/byt5-baseline-seed123/best \
-            models/byt5-baseline-seed777/best \
-    --weights 0.34 0.33 0.33 \
-    --output models/byt5-ensemble/
+# Launch full pipeline (3 seeds + ensemble merge)
+conda activate phi4
+cd /home/swatson/work/MachineLearning/kaggle/DeepPastChallengeTranslateAkkadianEnglish
+rm -f log/train_*.log
+nohup bash scripts/train_matched_ensemble.sh \
+    > log/train_matched_ensemble_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 ```
 
-Expected: 30 → 33-35 with ensemble alone.
+**Expected**: ~30-34 single model, ~34-35 ensemble (matching public baseline)
 
-### Step 3: Train longer (40-50 epochs)
-Val loss was still dropping at epoch 30 (0.6417). The model hasn't converged.
-Training to 50 epochs could squeeze another 1-2 points.
+### Step 2: Submit 4-model ensemble (quick win)
+`models/byt5-ensemble-4x` (seeds 42/123/777/280, equal weight) already exists but was never submitted.
+Upload and submit to see if 4 models > 3 models.
 
-### Step 4: Tune inference hyperparameters
-- Test `num_beams` = {4, 8, 12} and `length_penalty` = {0.8, 1.0, 1.2, 1.5}
-- Repetition penalty, no_repeat_ngram_size
-- MBR decoding (generate diverse candidates, pick consensus)
+### Step 3: Train longer (50-60 epochs)
+Val loss was still dropping at 40 epochs for all seeds. More gradient updates on tiny data = more learning.
+Train best config for 60 epochs and check convergence.
 
-### Step 5: Sentence-aligned raw data training
-v2/v3 failed on Kaggle because preprocessing created train/test mismatch.
-Smarter approach: use sentence-aligned data but **without preprocessing** (raw transliterations).
-This gives more and cleaner pairs (9K+) while matching test format.
+### Step 4: MBR decoding (inference improvement)
+Generate 15 diverse candidates (temperature=0.7) + 5 beam search candidates per input.
+Score each against all others using chrF++, select consensus winner.
+Reduces hallucination. 3-4x slower but within 9hr Kaggle limit.
+
+### Step 5: Larger model (byt5-base, 580M params)
+`google/byt5-base` has ~2x parameters. More capacity may help if regularized well.
+Risk: may overfit on small data. Test with strong regularization (label_smoothing=0.3, dropout).
 
 ### Score Tracker
 
 | Model | Config | Val Loss | Local GeoMean | Kaggle LB |
 |-------|--------|----------|---------------|-----------|
-| v1 (aligned) | preprocessed, aligned | — | — | — |
 | v2 (aligned-v2) | preprocessed, from v1 | 0.532 | 22.97 (sent) | 13.9 |
 | v3 (sent-only) | preprocessed, sent-only | — | — | 13.9 |
-| **baseline** | raw text, bidi, Adafactor, 30ep | 0.642 | 5.11 (doc) | **21.3** |
+| HF ensemble (3x) | batch=128, lr=3e-4, 30ep | 1.487 | 16.57 (val) | **18.2** |
+| baseline (single) | raw text, bidi, Adafactor, 30ep | 0.642 | 5.11 (doc) | **21.3** |
 | baseline-seed42 | same + 40ep | 0.612 | — | — |
 | baseline-seed123 | same + seed 123, 40ep | 0.651 | — | — |
 | baseline-seed777 | same + seed 777, 40ep | 0.596 | — | — |
-| **ensemble (3x)** | weighted avg (42/123/777) | — | — | **23.5** |
+| **ensemble (3x)** | weighted avg (42/123/777) + LP=2.0 | — | 23.5 (val) | **23.8** |
+| ensemble-4x | 4 seeds (42/123/777/280) | — | — | not submitted |
+| *public baseline* | *Toda DPC Starter, 3-seed ensemble* | — | — | *34.9* |
