@@ -686,3 +686,51 @@ Risk: may overfit on small data. Test with strong regularization (label_smoothin
 | **ensemble (3x)** | weighted avg (42/123/777) + LP=2.0 | — | 23.5 (val) | **23.8** |
 | ensemble-4x | 4 seeds (42/123/777/280) | — | — | not submitted |
 | *public baseline* | *Toda DPC Starter, 3-seed ensemble* | — | — | *34.9* |
+| matched-ensemble (3x) | HF Trainer, constant LR, 50ep | 2.027 | — | **26.0** |
+| matched-ensemble + rep_pen | same + repetition_penalty=1.3 | — | — | pending (v19) |
+| *public baseline* | *Toda DPC Starter, 3-seed ensemble* | — | — | *34.9 (pre-rescore)* |
+
+---
+
+## Monday Feb 23 Action Plan
+
+### Context
+- Final dataset update (3rd revision) expected Monday from Adam Anderson.
+- After that update, Kaggle will rescore **all** existing submissions — leaderboard will shift.
+- Our `matched-ensemble` scored **26.0** against the new labels. The public baseline's 34.9 is pre-rescore against old labels — not a fair comparison yet.
+- One confirmed deviation from Toda's baseline: we used `lr_scheduler_type="constant_with_warmup"` for 50 epochs; the baseline uses HF default **linear decay** for ~20 epochs. This is the primary untested fix.
+
+### Steps
+
+**1. Download the final `train.csv`** (after confirming Adam has posted the update):
+```bash
+conda activate phi4
+cd /home/swatson/work/MachineLearning/kaggle/DeepPastChallengeTranslateAkkadianEnglish
+kaggle competitions download -c deep-past-initiative-machine-translation -f train.csv -p data/raw/ --force
+```
+
+**2. Check the rescored leaderboard** — note updated scores for all submissions, especially the public baseline's new score, before spending time training.
+
+**3. Fix `train_matched.py`** — switch to linear LR decay to match Toda exactly:
+In `training_args`, change:
+- `lr_scheduler_type="constant_with_warmup"` → `"linear"`
+- `num_train_epochs=50` → `20` (linear decay makes late epochs near-zero LR anyway)
+
+**4. Update `scripts/train_matched_ensemble.sh`** to pass `--epochs 20`.
+
+**5. Retrain 3-seed ensemble** on the final `train.csv`:
+```bash
+rm -f log/train_*.log
+nohup bash scripts/train_matched_ensemble.sh > log/train_matched_ensemble_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+```
+Expected runtime: ~2h/seed × 3 seeds = ~6h total.
+
+**6. Submit** and compare against the rescored leaderboard.
+
+### Data quality issues to monitor (from MPWARE's Feb 21 audit)
+These may still be present in Monday's update — check after downloading:
+- `fem.` / `pl.` / `sing.` still in some translation rows
+- Inconsistent fractions: some `0.3333` as float, some as `⅓` — **leave as-is, don't convert**
+- Bare `x` tokens in translations that should be `<gap>`
+- Possessives inconsistent (`Anna's` vs `Annas`)
+- Roman numerals (e.g. "IVth") — no guidance yet; leave as-is
