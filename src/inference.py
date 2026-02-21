@@ -39,6 +39,7 @@ def generate_translations(
     num_beams: int = 4,
     max_new_tokens: int = 512,
     length_penalty: float = 2.0,
+    repetition_penalty: float = 1.3,
     autocast_ctx=None,
 ) -> list[str]:
     """Generate translations for a list of input texts.
@@ -52,6 +53,7 @@ def generate_translations(
         num_beams: Number of beams for beam search.
         max_new_tokens: Maximum tokens to generate.
         length_penalty: Length penalty for beam search (>1 = longer, <1 = shorter).
+        repetition_penalty: Discourages repeated tokens (>1.0); prevents beam degeneration loops.
         autocast_ctx: Optional autocast context manager for BF16.
 
     Returns:
@@ -81,6 +83,7 @@ def generate_translations(
                 num_beams=num_beams,
                 max_new_tokens=max_new_tokens,
                 length_penalty=length_penalty,
+                repetition_penalty=repetition_penalty,
                 early_stopping=True,
             )
 
@@ -106,6 +109,8 @@ def main():
                         help="Maximum new tokens to generate")
     parser.add_argument("--length-penalty", type=float, default=2.0,
                         help="Beam search length penalty (>1 encourages longer output)")
+    parser.add_argument("--repetition-penalty", type=float, default=1.3,
+                        help="Repetition penalty >1.0 discourages looping (1.3 recommended)")
     parser.add_argument("--bf16", action="store_true", default=False,
                         help="Use BF16 mixed precision (safe for ByT5)")
     parser.add_argument("--compile", action="store_true", default=False,
@@ -157,6 +162,7 @@ def main():
         num_beams=args.num_beams,
         max_new_tokens=args.max_new_tokens,
         length_penalty=args.length_penalty,
+        repetition_penalty=args.repetition_penalty,
         autocast_ctx=autocast_ctx,
     )
     elapsed = time.time() - start
