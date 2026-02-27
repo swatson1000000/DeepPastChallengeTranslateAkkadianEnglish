@@ -102,12 +102,15 @@ class EpochLoggingCallback(TrainerCallback):
             self.best_val_loss = val_loss
 
         best_marker = " ★ BEST" if is_new_best else ""
+        sep = "=" * 50
+        logger.info(sep)
         logger.info(
             f"Epoch {epoch}/{args.num_train_epochs}: "
             f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
             f"BLEU={bleu:.2f} chrF++={chrf:.2f} GeoMean={geo:.2f} "
             f"time={elapsed:.0f}s{best_marker}"
         )
+        logger.info(sep)
 
 
 def load_and_prepare_data(args):
@@ -241,6 +244,8 @@ def train(args):
     logger.info(f"Loading model: {args.model_name}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     model = AutoModelForSeq2SeqLM.from_pretrained(args.model_name)
+    if args.gradient_checkpointing:
+        model.config.use_cache = False  # Required: use_cache incompatible with gradient checkpointing
 
     num_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Parameters: {num_params:,}")
@@ -332,6 +337,10 @@ def train(args):
         weight_decay=0.01,
         # Generation during eval
         predict_with_generate=True,
+        # ByT5 config.max_length=20 bytes — far too short for doc-level translations
+        # (median 392 bytes, p90 1057 bytes). Without this, brevity penalty → 0 → BLEU ≈ 0.
+        # 512 covers p50 (392 bytes) well and keeps eval fast (~70s vs ~870s at 2048).
+        generation_max_length=512,
         # Logging — only at epoch boundaries, no fractional-epoch spam
         logging_strategy="epoch",
         report_to="none",

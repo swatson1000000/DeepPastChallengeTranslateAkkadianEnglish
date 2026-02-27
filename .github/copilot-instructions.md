@@ -85,7 +85,8 @@ Notebook `jupyter/akkadian-byt5-submission.ipynb` is the submission artifact:
 
 - **Checkpoints**: `models/byt5-akkadian/best/` (best val loss), `models/byt5-akkadian/epoch_N/`, `models/byt5-akkadian/final/`
 - **No fp16**: Causes NaN errors with ByT5 — FP16 exponent range too small
-- **BF16 is safe**: Same exponent range as FP32, use `--bf16` flag for ~2x throughput on GB10
+- **No bf16 for ByT5**: Empirically costs ~8 points on Kaggle vs FP32. BF16's reduced mantissa (8 bits vs 23) degrades byte-level generation quality. Always train and infer in **FP32**.
+- **torch.compile is safe for inference**: Use `--compile` for ~1.3–1.5x speedup on GB10 during inference. **Not compatible with HF Seq2SeqTrainer** — compiled model can't be pickled by DataLoader worker processes.
 - **GB10 optimizations**: `--bf16 --compile` enables BF16 autocast + torch.compile fused kernels. See `src/gpu_utils.py`
 - **Preprocessing**: H normalization (Ḫ→H), gap markers (`<gap>`/`<big_gap>`), accent→numbered forms, scribal notation removal. See `src/preprocess.py`
 - **Determinatives**: Keep `{d}`, `{ki}`, `{m}` etc. as-is — they encode semantic meaning

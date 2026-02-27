@@ -180,4 +180,26 @@ ls -la log/
 
 **Effective Date**: February 2, 2026  
 **Status**: Active  
-**Last Updated**: February 12, 2026
+**Last Updated**: February 24, 2026
+
+## Training Script Logging Conventions
+
+All training scripts **MUST** include a per-epoch summary callback with the following format:
+
+```
+========================================
+Epoch  N/20: train_loss=X.XXXX val_loss=X.XXXX BLEU=XX.XX chrF++=XX.XX GeoMean=XX.XX time=Xm XXs ★ BEST
+========================================
+```
+
+**Required fields:**
+1. **Epoch time in `Xm XXs` format** — always show elapsed time per epoch as minutes and seconds (e.g. `8m22s`), not raw seconds
+2. **`★ BEST` marker** — append ` ★ BEST` when the current epoch achieves a new best validation loss
+
+These must be implemented via a `TrainerCallback` (or equivalent) that:
+- Tracks `best_val_loss = float("inf")` across epochs
+- Records `epoch_start = time.time()` in `on_epoch_begin`
+- Computes `elapsed`, `mins, secs = divmod(elapsed, 60)` in `on_evaluate`
+- Compares `val_loss < best_val_loss` and sets the best marker accordingly
+
+See `src/train_toda.py` → `EpochSummaryCallback` as the reference implementation.

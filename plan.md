@@ -48,7 +48,7 @@ The model must learn from full-document pairs but predict individual sentences.
   - **Batch size**: 4
   - **Gradient accumulation**: 4 (effective batch = 16)
   - **Learning rate**: 5e-5
-  - **FP16**: OFF (critical — prevents NaN errors per top teams)
+  - **FP32 ONLY**: Never use FP16 (NaN errors) or BF16 (insufficient mantissa precision for ByT5 byte-level tokenizer — causes ~8 point Kaggle score drop vs FP32)
   - **Optimizer**: AdamW with weight decay 0.01
 - Save checkpoint, upload to Kaggle as Dataset
 
@@ -390,6 +390,7 @@ cd jupyter && kaggle kernels push -p .
 
 - **DO NOT use EvaCun/ORACC data** — Neo-Assyrian (911–539 BCE), 1,000 years wrong for Old Assyrian
 - **DO NOT use fp16** — causes NaN errors with ByT5
+- **DO NOT use bf16** — BF16 has only 8 bits of mantissa vs 23 in FP32. For ByT5's byte-level tokenizer (256+ vocab), this reduced precision degrades generation quality and costs ~8 points on Kaggle. Always train and infer in FP32.
 - **Public LB uses only 34% of test data** — private LB may shake significantly
 - **Conservative, semantically-accurate models** may outperform pattern-matchers on private LB
 - **The metric rewards n-gram overlap, not semantic accuracy** — optimize for BLEU/chrF++ directly
@@ -547,7 +548,6 @@ nohup python -u src/train_byt5.py \
     --grad-accum 8 \
     --max-length 512 \
     --seed 42 \
-    --bf16 \
     > log/train_byt5_baseline_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 ```
 
@@ -565,7 +565,7 @@ nohup python -u src/train_byt5.py \
 | Epochs | 30 | |
 | Max length | 512 | |
 | Warmup steps | 1053 (10% of 10,530 total) | |
-| Precision | BF16 autocast | Safe for ByT5 (same exponent as FP32) |
+| Precision | FP32 | BF16 degrades ByT5 quality — always use FP32 |
 | Gradient checkpointing | Yes | |
 | Preprocessing | OFF | Raw transliterations |
 | Seed | 42 | |
@@ -637,7 +637,7 @@ Ensemble script: `scripts/train_matched_ensemble.sh` (3 seeds → weight-average
 | Epochs | 20 | |
 | Bidirectional | Yes | Akk→Eng + Eng→Akk doubles data |
 | Max length | 512 | |
-| Precision | BF16 | Safe for ByT5 |
+| Precision | FP32 | BF16 degrades ByT5 quality — always use FP32 |
 | Gradient checkpointing | Yes | |
 | Eval | `predict_with_generate=True` | BLEU/chrF++/GeoMean per epoch |
 | Model selection | `load_best_model_at_end=True` | Best val loss |
@@ -727,6 +727,40 @@ Expected runtime: ~2h/seed × 3 seeds = ~6h total.
 
 **6. Submit** and compare against the rescored leaderboard.
 
+**7. Investigate why val metrics are stuck (matched-ensemble seed 42 analysis)**
+
+The completed seed 42 run (50 epochs, FP32, constant LR) showed:
+- **BLEU ≈ 0.0** throughout all 50 epochs — model never generates correct n-gram sequences on the val set
+- **chrF++ stuck ~5.1–5.2** from epoch 20 onward, barely moving despite val_loss still improving (2.05 → 2.04)
+- Training loss descending steadily (1.89 at epoch 50) with a widening train/val gap → mild overfitting
+- Val metrics here are **document-level**; Kaggle test is sentence-level — inherent mismatch
+
+Actions:
+- Sample a few val predictions from seed 42's best checkpoint and inspect them manually
+- Check if the model is collapsing to a degenerate output (e.g. repeated tokens, empty strings)
+- Confirm whether doc-level chrF++ ~5 is consistent with our ~26 Kaggle sentence-level score (it may just be the mismatched granularity)
+- If BLEU truly never fires, consider whether `max_new_tokens` during val eval is too short to generate full translations
+
+**8. Fix phrase repetition loops in beam search output**
+
+Inspecting val predictions revealed outputs like:
+> "our messenger, our messenger, our messenger and the stations..."
+> "as for this day, as for this day, as for this day anyone else..."
+
+The notebook already uses `repetition_penalty=1.3` but it doesn't work for ByT5 — byte-level tokenization means "our messenger" spans ~13 unique bytes, so the penalty barely registers until 10+ full phrase repetitions.
+
+**Option A — `no_repeat_ngram_size=12`** in `model.generate()` in the notebook:
+- Blocks any 12-byte sequence from repeating, roughly a 2-word no-repeat constraint
+- Previously removed (commit `6e63056`) at an unknown value because it hurt score — try higher value (12–16 bytes)
+- Risk: may block legitimate repeated phrases (e.g. proper nouns, formulaic OA language)
+
+**Option B — Post-processing deduplication** (safer):
+- After generation, detect repeated n-word phrases (e.g. trigrams repeated 2+ consecutive times) and collapse them
+- Only fires when loops actually occur; no impact on clean outputs
+- Add to both `src/inference.py` and the notebook
+
+Recommended: implement Option B as a safety net first, then test Option A on a held-out val sample to see if it improves GeoMean before adding it to the submission notebook.
+
 ### Data quality issues to monitor (from MPWARE's Feb 21 audit)
 These may still be present in Monday's update — check after downloading:
 - `fem.` / `pl.` / `sing.` still in some translation rows
@@ -734,3 +768,68 @@ These may still be present in Monday's update — check after downloading:
 - Bare `x` tokens in translations that should be `<gap>`
 - Possessives inconsistent (`Anna's` vs `Annas`)
 - Roman numerals (e.g. "IVth") — no guidance yet; leave as-is
+
+---
+
+## Known Issues / Improvements for Next Training Run
+
+### Fix: Save checkpoint on GeoMean, not val_loss
+**Status**: Not yet applied — will be in next retraining run.
+
+Currently `Seq2SeqTrainingArguments` uses:
+```python
+metric_for_best_model="eval_loss",
+greater_is_better=False,
+```
+
+This saves on val_loss, which is only a proxy. The competition metric is `GeoMean = sqrt(BLEU × chrF++)`. In seed 777, epoch 39 had GeoMean 41.34 but was not saved because its val_loss (2.026) was slightly worse than epoch 38 (2.023, GeoMean 40.68).
+
+**Fix** — change to:
+```python
+metric_for_best_model="eval_geo_mean",
+greater_is_better=True,
+```
+
+### Fix: BLEU was zero due to generation_max_length not set
+**Status**: Fixed Feb 26, 2026 — applied in seed 777 only.
+
+ByT5's `config.max_length = 20` bytes. Without `generation_max_length` in `Seq2SeqTrainingArguments`, HF Trainer generated only 20 bytes per val example during eval. With references averaging 511 bytes, sacrebleu's brevity penalty → 0 → BLEU ≈ 1e-6 throughout all epochs. Seeds 42 and 123 ran 50 epochs each with completely meaningless BLEU/GeoMean metrics (though val_loss-based checkpointing was unaffected).
+
+**Fix**: `generation_max_length=512` (covers p50=392 bytes and keeps eval fast ~220s vs ~870s at 2048).
+
+---
+
+## After Feb 23 Ensemble — Next Ablations
+
+After submitting the linear-LR matched ensemble, investigate these hypotheses if the score remains below ~30. Each is a candidate explanation for the ~8.5 point gap vs. Toda's 34.9.
+
+### A. Bidirectional training may be hurting us (HIGH PRIORITY)
+We train on Akk→Eng + Eng→Akk (2,810 pairs). Toda almost certainly trains only Akk→Eng (1,562 pairs). Half the model's capacity goes to a direction never tested at inference. This alone could easily cost 5+ points.
+
+**Experiment**: Train one seed unidirectional (`--no-bidirectional`) and compare val GeoMean against the equivalent bidirectional seed. If unidirectional is higher, drop bidirectional from the ensemble.
+
+### B. Inference parameters may be hurting us
+We just added `no_repeat_ngram_size=16` and `repetition_penalty=1.3` — these are untested on the actual Kaggle test set and could hurt as easily as help. Toda's inference is probably vanilla beam search with no penalties.
+
+**Experiment**: Run inference on local val set with and without these parameters. Compare GeoMean. If neutral or negative, revert to vanilla in the notebook before submitting.
+
+### C. Instruction prefix mismatch
+We prepend `"translate Akkadian to English: "` to all inputs during training and inference. If Toda uses no prefix or a different prefix, inference behavior would diverge from what it was trained on.
+
+**Check**: Inspect Toda's public notebook (if available on Kaggle discussion) for exact prefix string used.
+
+### D. num_beams too low
+We use `num_beams=4`. Toda may use 8 with a different `length_penalty`. Higher beam count generally improves translation quality at the cost of inference speed.
+
+**Experiment**: Test `num_beams=8` with `length_penalty=1.3` vs current `num_beams=4` on local val. If GeoMean improves, update the notebook. Note: Kaggle 9hr limit — ensure inference still completes in time.
+
+### E. Data quality audit on final train.csv
+After downloading the final `train.csv` (3rd revision from Adam Anderson), check for these known issues from MPWARE's Feb 21 audit:
+
+- `fem.` / `pl.` / `sing.` still in some translation rows — strip these annotations
+- Bare `x` tokens in translations that should be `<gap>` — normalize
+- Possessives inconsistent (`Anna's` vs `Annas`) — leave as-is unless a clear rule emerges
+- Roman numerals (e.g. "IVth") — leave as-is, no guidance yet
+- Inconsistent fractions: some `0.3333` as float, some as `⅓` — **leave as-is, don't convert**
+
+**Script**: Run `python src/preprocess.py --audit data/raw/train.csv` (or equivalent) to flag rows matching these patterns and decide whether to clean or leave. Any cleaning should be applied consistently to both training targets and inference post-processing.

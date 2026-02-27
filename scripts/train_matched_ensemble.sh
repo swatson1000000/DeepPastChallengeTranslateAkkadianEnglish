@@ -4,7 +4,7 @@
 #   - HF Seq2SeqTrainer with optim="adafactor" (relative_step=False, fixed LR + linear decay)
 #   - DataCollatorForSeq2Seq for dynamic padding
 #   - label_smoothing=0.2, batch=1, grad_accum=8
-#   - Bidirectional, BF16, gradient checkpointing
+#   - Bidirectional, FP32 (NO BF16 — costs ~8 points on Kaggle), gradient checkpointing
 #
 # Trains 3 seeds sequentially, then merges into ensemble.
 #
@@ -39,7 +39,7 @@ echo "  Data: ${DATA} (1,561 rows — exact baseline match)"
 echo "  Config: HF Seq2SeqTrainer, Adafactor (relative_step=False, linear decay)"
 echo "  Batch: ${BATCH} x ${GRAD_ACCUM} = $((BATCH * GRAD_ACCUM)) effective"
 echo "  Epochs: ${EPOCHS}, label_smoothing=${LABEL_SMOOTH}"
-echo "  BF16: ON, gradient_checkpointing: ON"
+  echo "  BF16: OFF (FP32 — required for ByT5, BF16 costs ~8 points), gradient_checkpointing: ON"
 echo "  Seeds: ${SEEDS[*]}"
 echo "  Started: $(date)"
 echo "============================================================"
@@ -66,8 +66,7 @@ for i in "${!SEEDS[@]}"; do
         --label-smoothing ${LABEL_SMOOTH} \
         --lr ${LR} \
         --bidirectional \
-        --seed ${SEED} \
-        --bf16
+        --seed ${SEED}
 
     echo "[${IDX}/${NUM_SEEDS}] Seed ${SEED} complete — $(date)"
     echo ""
