@@ -77,7 +77,7 @@ class EpochLoggingCallback(TrainerCallback):
     def __init__(self):
         self.epoch_start_time = None
         self.last_train_loss = None
-        self.best_val_loss = float("inf")
+        self.best_geo_mean = 0.0
 
     def on_epoch_begin(self, args, state, control, **kwargs):
         self.epoch_start_time = time.time()
@@ -96,10 +96,12 @@ class EpochLoggingCallback(TrainerCallback):
         geo = metrics.get("eval_geo_mean", 0)
         train_loss = self.last_train_loss if self.last_train_loss is not None else float("nan")
         elapsed = time.time() - self.epoch_start_time if self.epoch_start_time else 0
+        mins, secs = divmod(int(elapsed), 60)
+        time_str = f"{mins}m{secs:02d}s"
 
-        is_new_best = val_loss < self.best_val_loss
+        is_new_best = geo > self.best_geo_mean
         if is_new_best:
-            self.best_val_loss = val_loss
+            self.best_geo_mean = geo
 
         best_marker = " ★ BEST" if is_new_best else ""
         sep = "=" * 50
@@ -108,7 +110,7 @@ class EpochLoggingCallback(TrainerCallback):
             f"Epoch {epoch}/{args.num_train_epochs}: "
             f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
             f"BLEU={bleu:.2f} chrF++={chrf:.2f} GeoMean={geo:.2f} "
-            f"time={elapsed:.0f}s{best_marker}"
+            f"time={time_str}{best_marker}"
         )
         logger.info(sep)
 
@@ -314,8 +316,11 @@ def train(args):
         save_strategy="epoch",
         save_total_limit=2,
         load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
+        # Save on GeoMean (competition metric) not val_loss.
+        # Seed 777 evidence: epoch 42 was saved on val_loss but epoch 50 had
+        # GeoMean=43.24 vs epoch 42's 42.09 — a 1.15 point miss.
+        metric_for_best_model="eval_geo_mean",
+        greater_is_better=True,
         # Optimizer — "adafactor" in HF Trainer sets:
         #   relative_step=False, scale_parameter=False, lr=learning_rate
         # Use constant LR (no decay) so the model keeps learning throughout all epochs.

@@ -8,15 +8,16 @@ The top public baseline (34.9) uses exactly this technique:
     3 ByT5 checkpoints → weighted parameter averaging → single merged model
 
 Usage:
-    python src/ensemble.py \
-        --models models/byt5-seed42/best models/byt5-seed123/best models/byt5-seed777/best \
-        --weights 0.4 0.3 0.3 \
-        --output models/byt5-ensemble/
+    # Default: merges all three matched seeds with equal weights
+    python src/ensemble.py
 
-    # Equal-weight averaging (default):
+    # Custom weights:
     python src/ensemble.py \
-        --models models/byt5-seed42/best models/byt5-seed123/best \
-        --output models/byt5-ensemble/
+        --models models/byt5-matched-seed42/best \
+                 models/byt5-matched-seed123/best \
+                 models/byt5-matched-seed777/best \
+        --weights 0.4 0.3 0.3 \
+        --output models/byt5-matched-ensemble
 """
 
 import sys
@@ -129,19 +130,27 @@ def merge_and_save(
     logger.info(f"Metadata: {meta_path}")
 
 
+DEFAULT_MODELS = [
+    "models/byt5-matched-seed42/best",
+    "models/byt5-matched-seed123/best",
+    "models/byt5-matched-seed777/best",
+]
+DEFAULT_OUTPUT = "models/byt5-matched-ensemble"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Weight-average ByT5 checkpoints")
     parser.add_argument(
-        "--models", type=str, nargs="+", required=True,
-        help="Paths to model checkpoints to average",
+        "--models", type=str, nargs="+", default=DEFAULT_MODELS,
+        help="Paths to model checkpoints to average (default: all three matched seeds)",
     )
     parser.add_argument(
         "--weights", type=float, nargs="*", default=None,
         help="Weights for each model (optional; must match --models count)",
     )
     parser.add_argument(
-        "--output", type=str, required=True,
-        help="Output directory for merged model",
+        "--output", type=str, default=DEFAULT_OUTPUT,
+        help="Output directory for merged model (default: models/byt5-matched-ensemble)",
     )
     return parser.parse_args()
 
